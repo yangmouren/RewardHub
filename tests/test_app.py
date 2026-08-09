@@ -46,6 +46,8 @@ class PointsManagerApiTests(unittest.TestCase):
         for account in accounts:
             if account["role"] == "child" or account["username"] != "admin":
                 self.client.delete(f"/api/accounts/{account['id']}")
+        with type(self).connection() as conn:
+            conn.execute("UPDATE app_settings SET value = '100' WHERE key = 'points_per_yuan'")
 
     def create_child(self, username="child1", display_name="小明", password="child123"):
         response = self.client.post(
@@ -143,6 +145,56 @@ class PointsManagerApiTests(unittest.TestCase):
             with type(self).connection() as conn:
                 for table in ("account_logs", "point_requests", "records", "earn_items", "deduct_items", "rewards", "accounts"):
                     conn.execute(f"DELETE FROM {table}")
+                type(self).create_admin_account(conn, "admin", "admin123")
+
+    def test_child_can_register_from_auth_flow(self):
+        self.client.post("/api/auth/logout")
+        response = self.client.post(
+            "/api/auth/register-child",
+            json={
+                "username": "self-child",
+                "display_name": "自助孩子",
+                "password": "child123",
+                "password_confirm": "child123",
+                "avatar": "girl",
+                "role": "admin",
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+        data = response.get_json()
+        self.assertEqual(data["user"]["role"], "child")
+        self.assertEqual(data["user"]["avatar"], "girl")
+        self.assertEqual(data["active_child"]["username"], "self-child")
+        self.assertTrue(data["earn_items"])
+
+        self.client.post("/api/auth/logout")
+        self.assertEqual(
+            self.client.post(
+                "/api/auth/login", json={"username": "self-child", "password": "child123"}
+            ).status_code,
+            200,
+        )
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        self.assertIn("register_child", {log["action"] for log in self.state()["account_logs"]})
+
+    def test_child_registration_requires_admin_setup(self):
+        with type(self).connection() as conn:
+            conn.execute("DELETE FROM accounts")
+        try:
+            response = self.client.post(
+                "/api/auth/register-child",
+                json={
+                    "username": "orphan-child",
+                    "display_name": "孤立孩子",
+                    "password": "child123",
+                    "password_confirm": "child123",
+                    "avatar": "boy",
+                },
+            )
+            self.assertEqual(response.status_code, 409)
+        finally:
+            with type(self).connection() as conn:
                 type(self).create_admin_account(conn, "admin", "admin123")
 
     def test_install_credentials_replace_only_untouched_legacy_admin(self):
@@ -260,7 +312,7 @@ class PointsManagerApiTests(unittest.TestCase):
     def test_v06_child_permissions_avatars_and_account_edit(self):
         self.create_child(username="child", display_name="小朋友")
         state = self.state()
-        self.assertEqual(state["version"], "0.6.17")
+        self.assertEqual(state["version"], "0.6.18")
         self.assertEqual(state["user"]["avatar"], "adult-male")
         self.assertEqual(state["active_child"]["avatar"], "boy")
 
@@ -309,6 +361,61 @@ class PointsManagerApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["user"]["display_name"], "新名字")
         self.assertEqual(response.get_json()["user"]["avatar"], "girl")
+
+    def test_currency_settings_and_cash_exchange_require_approval(self):
+        self.create_child(username="cash-child", display_name="现金孩子")
+        state = self.state()
+        self.assertEqual(state["settings"]["points_per_yuan"], 100)
+
+        response = self.client.put("/api/settings", json={"points_per_yuan": 250})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["settings"]["points_per_yuan"], 250)
+
+        response = self.client.post("/api/transactions", json={"kind": "earn", "points": 500, "name": "管理员发放"})
+        self.assertEqual(response.status_code, 201)
+        self.client.post("/api/auth/logout")
+        self.assertEqual(
+            self.client.post("/api/auth/login", json={"username": "cash-child", "password": "child123"}).status_code,
+            200,
+        )
+        response = self.client.post("/api/transactions", json={"kind": "cash_exchange", "points": 250})
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.get_json()["request_submitted"])
+        self.assertEqual(response.get_json()["total_points"], 500)
+        request_id = response.get_json()["request_id"]
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        response = self.client.post(f"/api/requests/{request_id}/approve")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["total_points"], 250)
+        self.assertIn("兑换现金 ¥1.00", [record["title"] for record in response.get_json()["records"]])
+
+    def test_child_can_change_own_password(self):
+        child = self.create_child(username="password-child", display_name="改密孩子")
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": child["username"], "password": "child123"})
+        response = self.client.put(
+            "/api/auth/password",
+            json={"current_password": "wrong-password", "password": "newchild123", "password_confirm": "newchild123"},
+        )
+        self.assertEqual(response.status_code, 401)
+        response = self.client.put(
+            "/api/auth/password",
+            json={"current_password": "child123", "password": "newchild123", "password_confirm": "newchild123"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.client.post("/api/auth/logout")
+        self.assertEqual(
+            self.client.post("/api/auth/login", json={"username": child["username"], "password": "child123"}).status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.post("/api/auth/login", json={"username": child["username"], "password": "newchild123"}).status_code,
+            200,
+        )
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        self.assertIn("change_password", {log["action"] for log in self.state()["account_logs"]})
 
     def test_password_updates_and_last_child_can_be_deleted(self):
         child = self.create_child(username="child", display_name="小朋友")
@@ -374,21 +481,50 @@ class PointsManagerApiTests(unittest.TestCase):
 
     def test_custom_items_and_manual_history(self):
         self.create_child()
-        response = self.client.post("/api/items/earn", json={"name": "整理书桌", "points": 6, "icon": "television.svg"})
+        response = self.client.post("/api/items/earn", json={"name": "整理书桌", "points": 6, "icon": "computer.svg"})
         self.assertEqual(response.status_code, 201)
         item_id = response.get_json()["id"]
-        self.assertEqual(response.get_json()["icon"], "television.svg")
+        self.assertEqual(response.get_json()["icon"], "computer.svg")
 
         response = self.client.put(f"/api/items/earn/{item_id}", json={"name": "整理书桌并复习", "points": 9, "icon": "game.svg"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["name"], "整理书桌并复习")
         self.assertEqual(response.get_json()["icon"], "game.svg")
 
+        response = self.client.post("/api/items/earn", json={"name": "做饭", "points": 8, "icon": "cooking.svg"})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["icon"], "cooking.svg")
+        self.assertEqual(
+            self.client.post("/api/items/earn", json={"name": "不使用的图标", "points": 8, "icon": "camera.svg"}).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.post("/api/items/earn", json={"name": "水果", "points": 8, "icon": "apple.svg"}).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/api/items/earn",
+                json={"name": "不允许的远程图标", "points": 8, "icon": "iconify:fluent-emoji:pot-of-food"},
+            ).status_code,
+            400,
+        )
+
         response = self.client.post("/api/transactions", json={"kind": "manual", "name": "历史补录", "points": 12, "date": "2026-01-02"})
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.get_json()["records"][0]["date"], "2026-01-02")
 
         self.assertEqual(self.client.delete(f"/api/items/earn/{item_id}").status_code, 200)
+
+    def test_life_icons_are_shared_by_earn_deduct_and_reward(self):
+        self.create_child()
+        for kind, name in (("earn", "洗衣"), ("deduct", "洗碗"), ("reward", "购物")):
+            response = self.client.post(
+                f"/api/items/{kind}",
+                json={"name": name, "points": 8, "icon": "laundry.svg"},
+            )
+            self.assertEqual(response.status_code, 201)
+            self.assertEqual(response.get_json()["icon"], "laundry.svg")
 
     def test_clear_and_reset(self):
         self.create_child()

@@ -27,15 +27,24 @@ DATA_DIR = Path(os.getenv("DATA_DIR", str(DEFAULT_DATA_DIR)))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(DATA_DIR / "points.db")))
 SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-key-in-production")
 PASSWORD_ITERATIONS = 240_000
-APP_VERSION = "0.6.17"
+APP_VERSION = "0.6.18"
 AVATAR_OPTIONS = {"boy", "girl", "adult-male", "adult-female"}
 CHILD_AVATARS = {"boy", "girl"}
 PROJECT_ICONS = {
     "television.svg", "book.svg", "homework.svg", "chore.svg", "sport.svg",
     "bedtime.svg", "snack.svg", "game.svg", "outing.svg", "points.svg",
-    "gift.svg", "warning.svg",
+    "gift.svg", "warning.svg", "computer.svg", "desktop.svg", "money.svg",
+    "phone.svg", "cooking.svg", "cleaning.svg", "school.svg", "toothbrush.svg",
+    "bath.svg", "pencil.svg", "clothes.svg", "laundry.svg", "dishes.svg",
+    "pet.svg", "walk.svg", "shopping.svg", "backpack.svg", "handwash.svg",
+    "water.svg", "plant.svg", "tidy.svg", "trash.svg", "lunch.svg",
 }
 ITEM_DEFAULT_ICONS = {"earn": "points.svg", "deduct": "warning.svg", "reward": "gift.svg"}
+DEFAULT_SETTINGS = {"points_per_yuan": 100}
+
+
+def valid_project_icon(icon: str | None) -> bool:
+    return isinstance(icon, str) and icon in PROJECT_ICONS
 
 DEFAULT_EARN_ITEMS = [
     ("完成作业", 10, "homework.svg"),
@@ -240,7 +249,7 @@ def migrate_point_requests(conn: sqlite3.Connection) -> None:
     schema = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'point_requests'"
     ).fetchone()
-    if schema is None or "exchange" in (schema["sql"] or ""):
+    if schema is None or "cash_exchange" in (schema["sql"] or ""):
         return
     conn.execute("ALTER TABLE point_requests RENAME TO point_requests_legacy")
     conn.execute(
@@ -249,7 +258,7 @@ def migrate_point_requests(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL,
             requester_id INTEGER NOT NULL,
-            kind TEXT NOT NULL CHECK (kind IN ('earn', 'deduct', 'exchange', 'manual')),
+            kind TEXT NOT NULL CHECK (kind IN ('earn', 'deduct', 'exchange', 'cash_exchange', 'manual')),
             title TEXT NOT NULL,
             amount INTEGER NOT NULL,
             type TEXT NOT NULL CHECK (type IN ('income', 'expense')),
@@ -361,7 +370,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_id INTEGER NOT NULL,
                 requester_id INTEGER NOT NULL,
-                kind TEXT NOT NULL CHECK (kind IN ('earn', 'deduct', 'exchange', 'manual')),
+                kind TEXT NOT NULL CHECK (kind IN ('earn', 'deduct', 'exchange', 'cash_exchange', 'manual')),
                 title TEXT NOT NULL,
                 amount INTEGER NOT NULL,
                 type TEXT NOT NULL CHECK (type IN ('income', 'expense')),
@@ -387,6 +396,11 @@ def init_db() -> None:
                 action TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         migrate_point_requests(conn)
@@ -403,10 +417,16 @@ def init_db() -> None:
                 conn.execute(
                     f"ALTER TABLE {ITEM_TABLES[table]} ADD COLUMN icon TEXT NOT NULL DEFAULT '{default_icon}'"
                 )
-            conn.execute(
-                f"UPDATE {ITEM_TABLES[table]} SET icon = ? WHERE icon IS NULL OR TRIM(icon) = '' OR icon NOT IN ({','.join('?' for _ in PROJECT_ICONS)})",
-                (default_icon, *PROJECT_ICONS),
-            )
+            for row in conn.execute(f"SELECT id, icon FROM {ITEM_TABLES[table]}").fetchall():
+                if not valid_project_icon(row["icon"]):
+                    conn.execute(
+                        f"UPDATE {ITEM_TABLES[table]} SET icon = ? WHERE id = ?",
+                        (default_icon, row["id"]),
+                    )
+        conn.execute(
+            "INSERT OR IGNORE INTO app_settings(key, value, updated_at) VALUES (?, ?, ?)",
+            ("points_per_yuan", str(DEFAULT_SETTINGS["points_per_yuan"]), datetime.now().astimezone().isoformat(timespec="seconds")),
+        )
 
         credentials = admin_credentials_from_env()
         if credentials and not install_credentials_are_applied(credentials):
@@ -449,6 +469,19 @@ def positive_int(value: Any, label: str = "积分") -> int:
     if number <= 0:
         raise ValueError(f"{label}必须大于 0")
     return number
+
+
+def points_per_yuan(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT value FROM app_settings WHERE key = 'points_per_yuan'").fetchone()
+    try:
+        rate = int(row["value"]) if row else DEFAULT_SETTINGS["points_per_yuan"]
+    except (TypeError, ValueError):
+        rate = DEFAULT_SETTINGS["points_per_yuan"]
+    return rate if rate > 0 else DEFAULT_SETTINGS["points_per_yuan"]
+
+
+def settings_payload(conn: sqlite3.Connection) -> dict[str, Any]:
+    return {"points_per_yuan": points_per_yuan(conn)}
 
 
 def safe_account(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -591,6 +624,7 @@ def state_payload(conn: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]
     if account_id is None:
         return {
             "version": APP_VERSION,
+            "settings": settings_payload(conn),
             "user": safe_account(user),
             "children": [],
             "active_child": None,
@@ -620,6 +654,7 @@ def state_payload(conn: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]
     children = conn.execute("SELECT * FROM accounts WHERE role = 'child' AND active = 1 ORDER BY id").fetchall()
     return {
         "version": APP_VERSION,
+        "settings": settings_payload(conn),
         "user": safe_account(user),
         "children": [safe_account(row) for row in children],
         "active_child": safe_account(active_child),
@@ -673,7 +708,7 @@ def custom_asset(asset_key: str):
 
 @app.get("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", app_version=APP_VERSION)
 
 
 @app.get("/api/health")
@@ -737,10 +772,117 @@ def login():
         return jsonify(state_payload(conn, user))
 
 
+@app.post("/api/auth/register-child")
+def register_child():
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get("username", "")).strip()
+    display_name = str(payload.get("display_name", "")).strip()
+    password = str(payload.get("password", ""))
+    password_confirm = str(payload.get("password_confirm", ""))
+    avatar = str(payload.get("avatar") or "boy")
+    if not USERNAME_PATTERN.fullmatch(username):
+        return api_error("孩子账号需为 3-32 位字母、数字、下划线、点或短横线")
+    if len(password) < 6:
+        return api_error("孩子密码至少需要 6 位")
+    if password != password_confirm:
+        return api_error("两次输入的密码不一致")
+    if avatar not in CHILD_AVATARS:
+        return api_error("孩子头像类型无效")
+    if not display_name:
+        display_name = username
+    with connection() as conn:
+        admin = conn.execute(
+            "SELECT 1 FROM accounts WHERE role = 'admin' AND active = 1 LIMIT 1"
+        ).fetchone()
+        if admin is None:
+            return api_error("请先完成管理员首次设置", 409)
+        try:
+            cursor = conn.execute(
+                "INSERT INTO accounts(username, password_hash, display_name, role, avatar, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    username,
+                    password_hash(password),
+                    display_name,
+                    "child",
+                    avatar,
+                    datetime.now().astimezone().isoformat(timespec="seconds"),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            return api_error("账号名已存在")
+        seed_items_for_child(conn, int(cursor.lastrowid))
+        user = conn.execute("SELECT * FROM accounts WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        conn.execute(
+            """
+            INSERT INTO account_logs(
+                actor_id, actor_username, actor_name, actor_avatar, target_id, target_username,
+                target_name, target_role, target_avatar, action, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"],
+                user["username"],
+                user["display_name"],
+                user["avatar"],
+                user["id"],
+                user["username"],
+                user["display_name"],
+                user["role"],
+                user["avatar"],
+                "register_child",
+                now,
+            ),
+        )
+        session.clear()
+        session["user_id"] = int(user["id"])
+        session["selected_child_id"] = int(user["id"])
+        return jsonify(state_payload(conn, user)), 201
+
+
 @app.post("/api/auth/logout")
 def logout():
     session.clear()
     return jsonify({"ok": True})
+
+
+@app.put("/api/auth/password")
+@require_user
+def change_own_password():
+    payload = request.get_json(silent=True) or {}
+    current_password = str(payload.get("current_password", ""))
+    new_password = str(payload.get("password", ""))
+    password_confirm = str(payload.get("password_confirm", ""))
+    if len(new_password) < 6:
+        return api_error("新密码至少需要 6 位")
+    if new_password != password_confirm:
+        return api_error("两次输入的新密码不一致")
+    with connection() as conn:
+        user = current_user(conn)
+        if user is None:
+            return api_error("请先登录", 401)
+        if user["role"] != "child":
+            return api_error("管理账号请在账号管理中修改密码", 403)
+        if not password_matches(current_password, user["password_hash"]):
+            return api_error("当前密码错误", 401)
+        conn.execute(
+            "UPDATE accounts SET password_hash = ? WHERE id = ?",
+            (password_hash(new_password), user["id"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO account_logs(
+                actor_id, actor_username, actor_name, actor_avatar, target_id, target_username,
+                target_name, target_role, target_avatar, action, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"], user["username"], user["display_name"], user["avatar"],
+                user["id"], user["username"], user["display_name"], user["role"], user["avatar"],
+                "change_password", datetime.now().astimezone().isoformat(timespec="seconds"),
+            ),
+        )
+        return jsonify({"ok": True})
 
 
 @app.get("/api/auth/me")
@@ -759,12 +901,12 @@ def select_child():
     try:
         child_id = int(payload.get("child_id"))
     except (TypeError, ValueError):
-        return api_error("娃娃账号无效")
+        return api_error("孩子账号无效")
     with connection() as conn:
         user = current_user(conn)
         child = conn.execute("SELECT * FROM accounts WHERE id = ? AND role = 'child' AND active = 1", (child_id,)).fetchone()
         if user is None or child is None:
-            return api_error("娃娃账号不存在", 404)
+            return api_error("孩子账号不存在", 404)
         session["selected_child_id"] = child_id
         return jsonify(state_payload(conn, user))
 
@@ -926,6 +1068,31 @@ def get_state():
         return jsonify(state_payload(conn, user))
 
 
+@app.route("/api/settings", methods=["PUT", "PATCH"])
+@require_admin
+def update_settings():
+    payload = request.get_json(silent=True) or {}
+    try:
+        rate = positive_int(payload.get("points_per_yuan"), "换算比例")
+    except ValueError as exc:
+        return api_error(str(exc))
+    if rate > 1_000_000:
+        return api_error("换算比例不能超过 1000000")
+    with connection() as conn:
+        user = current_user(conn)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        updated = conn.execute(
+            "UPDATE app_settings SET value = ?, updated_at = ? WHERE key = 'points_per_yuan'",
+            (str(rate), now),
+        )
+        if updated.rowcount == 0:
+            conn.execute(
+                "INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?)",
+                ("points_per_yuan", str(rate), now),
+            )
+        return jsonify(state_payload(conn, user))
+
+
 @app.post("/api/transactions")
 @require_user
 def create_transaction():
@@ -935,10 +1102,12 @@ def create_transaction():
         with connection() as conn:
             user = current_user(conn)
             if user["role"] == "child" and kind == "deduct":
-                return api_error("娃娃账号不能直接扣取积分，请使用兑换奖励", 403)
+                return api_error("孩子账号不能直接扣取积分，请使用兑换奖励", 403)
+            if kind == "cash_exchange" and user["role"] != "child":
+                return api_error("只有孩子账号可以兑换现金", 403)
             account_id = active_child_id(conn, user)
             if account_id is None:
-                return api_error("当前没有可用的娃娃账号")
+                return api_error("当前没有可用的孩子账号")
             name = str(payload.get("name", "")).strip()
             points_value = payload.get("points")
             transaction_type = "income"
@@ -973,6 +1142,13 @@ def create_transaction():
                     return api_error("积分不足", 409)
                 amount = -points
                 transaction_type = "expense"
+            elif kind == "cash_exchange":
+                points = positive_int(points_value, "兑换积分")
+                if get_balance(conn, account_id) < points:
+                    return api_error("积分不足", 409)
+                amount = -points
+                name = f"兑换现金 ¥{points / points_per_yuan(conn):.2f}"
+                transaction_type = "expense"
             elif kind == "manual":
                 try:
                     amount = int(points_value)
@@ -988,9 +1164,9 @@ def create_transaction():
             transaction_time = str(payload.get("time") or current_time())[:5]
             if not name:
                 name = transaction_date
-            if user["role"] == "child" and amount < 0 and kind != "exchange":
-                return api_error("娃娃账号不能扣除积分", 403)
-            if user["role"] == "child" and kind in ("earn", "exchange", "manual"):
+            if user["role"] == "child" and amount < 0 and kind not in ("exchange", "cash_exchange"):
+                return api_error("孩子账号不能扣除积分", 403)
+            if user["role"] == "child" and kind in ("earn", "exchange", "manual", "cash_exchange"):
                 cursor = conn.execute(
                     """
                     INSERT INTO point_requests(
@@ -1078,7 +1254,7 @@ def undo_transaction(record_id: int):
     with connection() as conn:
         user = current_user(conn)
         if user["role"] == "child":
-            return api_error("娃娃账号不能撤销积分记录", 403)
+            return api_error("孩子账号不能撤销积分记录", 403)
         account_id = active_child_id(conn, user)
         cursor = conn.execute("DELETE FROM records WHERE id = ? AND account_id = ?", (record_id, account_id))
         if cursor.rowcount == 0:
@@ -1100,13 +1276,13 @@ def create_item(kind: str):
         return api_error(str(exc))
     if not name:
         return api_error("项目名称不能为空")
-    if icon not in PROJECT_ICONS:
+    if not valid_project_icon(icon):
         return api_error("项目图片类型无效")
     with connection() as conn:
         user = current_user(conn)
         account_id = active_child_id(conn, user)
         if account_id is None:
-            return api_error("当前没有可用的娃娃账号")
+            return api_error("当前没有可用的孩子账号")
         table = ITEM_TABLES[kind]
         cursor = conn.execute(f"INSERT INTO {table}(account_id, name, points, icon) VALUES (?, ?, ?, ?)", (account_id, name, points, icon))
         row = conn.execute(f"SELECT id, name, points, icon FROM {table} WHERE id = ?", (cursor.lastrowid,)).fetchone()
@@ -1133,7 +1309,7 @@ def item_detail(kind: str, item_id: int):
         icon = str(payload.get("icon") or existing["icon"] or ITEM_DEFAULT_ICONS[kind])
         if not name:
             return api_error("项目名称不能为空")
-        if icon not in PROJECT_ICONS:
+        if not valid_project_icon(icon):
             return api_error("项目图片类型无效")
         try:
             points = positive_int(payload.get("points"))
@@ -1162,7 +1338,7 @@ def reset_system():
         user = current_user(conn)
         account_id = active_child_id(conn, user)
         if account_id is None:
-            return api_error("当前没有可用的娃娃账号")
+            return api_error("当前没有可用的孩子账号")
         conn.execute("DELETE FROM records WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM point_requests WHERE account_id = ?", (account_id,))
         for table in ("earn_items", "deduct_items", "rewards"):

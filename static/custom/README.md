@@ -2,8 +2,8 @@
 
 请把要替换的图片放在这个文件夹中。建议使用 PNG、JPG 或 WebP 格式，文件名暂按下面的名称准备：
 
-- `child-boy.png`：男孩娃娃账号头像
-- `child-girl.png`：女孩娃娃账号头像
+- `child-boy.png`：男孩孩子账号头像
+- `child-girl.png`：女孩孩子账号头像
 - `adult-male.png`：男性管理账号头像
 - `adult-female.png`：女性管理账号头像
 - `account-log.png`：账号变更日志配图

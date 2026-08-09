@@ -33,6 +33,14 @@ const PROJECT_ICONS = [
   ["chore.svg", "家务"], ["sport.svg", "运动"], ["bedtime.svg", "早睡"],
   ["television.svg", "电视"], ["game.svg", "游戏"], ["snack.svg", "零食"],
   ["outing.svg", "外出"], ["gift.svg", "奖励"], ["warning.svg", "提醒"],
+  ["computer.svg", "电脑"], ["desktop.svg", "桌面"], ["money.svg", "现金"],
+  ["phone.svg", "手机"], ["cooking.svg", "做饭"], ["cleaning.svg", "清洁"],
+  ["school.svg", "学校"], ["toothbrush.svg", "刷牙"], ["bath.svg", "洗澡"],
+  ["pencil.svg", "学习"], ["clothes.svg", "穿衣"], ["laundry.svg", "洗衣"],
+  ["dishes.svg", "洗碗"], ["pet.svg", "宠物"], ["walk.svg", "散步"],
+  ["shopping.svg", "购物"], ["backpack.svg", "书包"], ["handwash.svg", "洗手"],
+  ["water.svg", "喝水"], ["plant.svg", "植物"], ["tidy.svg", "收纳"],
+  ["trash.svg", "垃圾"], ["lunch.svg", "午餐"],
 ];
 const DEFAULT_ITEM_ICONS = { earn: "points.svg", deduct: "warning.svg", reward: "gift.svg" };
 const dayNames = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
@@ -99,6 +107,33 @@ function dayTotal(date) {
   return recordsFor(date).reduce((total, record) => total + Number(record.amount), 0);
 }
 
+function pointsRate() {
+  return Number(appState.data?.settings?.points_per_yuan) > 0 ? Number(appState.data.settings.points_per_yuan) : 100;
+}
+
+function moneyFromPoints(points) {
+  return (Number(points) || 0) / pointsRate();
+}
+
+function moneyText(points) {
+  return `¥${moneyFromPoints(points).toFixed(2)}`;
+}
+
+function pointsText(points, includeMoney = true) {
+  const value = Number(points) || 0;
+  return includeMoney ? `${value.toLocaleString("zh-CN")} 积分 · ${moneyText(value)}` : `${value.toLocaleString("zh-CN")} 积分`;
+}
+
+function updateCurrencyUi() {
+  const rate = pointsRate();
+  const rule = document.getElementById("currency-rule");
+  if (rule) rule.textContent = `${rate.toLocaleString("zh-CN")} 积分 = 1 元`;
+  const input = document.querySelector("#currency-form input[name='points_per_yuan']");
+  if (input && document.activeElement !== input) input.value = rate;
+  const cashRate = document.getElementById("cash-exchange-rate");
+  if (cashRate) cashRate.textContent = `当前比例：${rate.toLocaleString("zh-CN")} 积分 = 1 元`;
+}
+
 async function api(url, options = {}) {
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -137,6 +172,7 @@ async function loadState() {
 function showApp() {
   document.getElementById("login-screen").classList.add("hidden");
   document.getElementById("setup-screen").classList.add("hidden");
+  document.getElementById("child-register-screen").classList.add("hidden");
   document.getElementById("app-header").classList.remove("hidden");
   document.getElementById("app-shell").classList.remove("hidden");
   document.getElementById("bottom-nav").classList.remove("hidden");
@@ -149,6 +185,7 @@ function showLogin() {
   closeModal();
   document.getElementById("login-screen").classList.remove("hidden");
   document.getElementById("setup-screen").classList.add("hidden");
+  document.getElementById("child-register-screen").classList.add("hidden");
   document.getElementById("app-header").classList.add("hidden");
   document.getElementById("app-shell").classList.add("hidden");
   document.getElementById("bottom-nav").classList.add("hidden");
@@ -159,9 +196,22 @@ function showSetup() {
   closeModal();
   document.getElementById("login-screen").classList.add("hidden");
   document.getElementById("setup-screen").classList.remove("hidden");
+  document.getElementById("child-register-screen").classList.add("hidden");
   document.getElementById("app-header").classList.add("hidden");
   document.getElementById("app-shell").classList.add("hidden");
   document.getElementById("bottom-nav").classList.add("hidden");
+}
+
+function showChildRegister() {
+  appState.data = null;
+  closeModal();
+  document.getElementById("login-screen").classList.add("hidden");
+  document.getElementById("setup-screen").classList.add("hidden");
+  document.getElementById("child-register-screen").classList.remove("hidden");
+  document.getElementById("app-header").classList.add("hidden");
+  document.getElementById("app-shell").classList.add("hidden");
+  document.getElementById("bottom-nav").classList.add("hidden");
+  document.querySelector("#child-register-form input[name='username']")?.focus();
 }
 
 function updateAccountUi() {
@@ -170,7 +220,7 @@ function updateAccountUi() {
   document.body.dataset.role = isAdmin ? "admin" : "child";
   document.querySelectorAll(".admin-only").forEach((element) => element.classList.toggle("hidden", !isAdmin));
   document.querySelectorAll(".child-only").forEach((element) => element.classList.toggle("hidden", isAdmin));
-  document.getElementById("account-label").textContent = user ? `${user.display_name} · ${isAdmin ? "管理账号" : "娃娃账号"}` : "";
+  document.getElementById("account-label").textContent = user ? `${user.display_name} · ${isAdmin ? "管理账号" : "孩子账号"}` : "";
   setImageSource(document.getElementById("user-avatar"), avatarSource(user?.avatar), avatarFallback(user?.avatar));
   document.getElementById("nav-requests-label").textContent = isAdmin ? "审核" : "申请";
   const selector = document.getElementById("child-select");
@@ -206,6 +256,7 @@ function render() {
   renderRequests();
   renderAccounts();
   renderRecords();
+  updateCurrencyUi();
 }
 
 function activeAccount() {
@@ -230,25 +281,26 @@ function renderHome() {
     current.setDate(current.getDate() - day + index + 1);
     return sum + dayTotal(localDate(current));
   }, 0);
-  document.getElementById("home-title").textContent = user.role === "admin" ? (hasChild ? "家庭监控总控" : "先创建娃娃账号") : "我的积分空间";
-  document.getElementById("home-subtitle").textContent = user.role === "admin" ? (hasChild ? "总览积分、审批和账户状态，快速执行家庭规则" : "当前还没有娃娃账号，请先到账号管理创建") : "完成任务后申请积分，等待家长审核到账";
+  document.getElementById("home-title").textContent = user.role === "admin" ? (hasChild ? "家庭监控总控" : "先创建孩子账号") : "我的积分空间";
+  document.getElementById("home-subtitle").textContent = user.role === "admin" ? (hasChild ? "总览积分、审批和账户状态，快速执行家庭规则" : "当前还没有孩子账号，请先到账号管理创建") : "完成任务后申请积分，等待家长审核到账";
   document.getElementById("today-label").textContent = today;
   setImageSource(
     document.getElementById("active-avatar"),
     account.avatar ? avatarSource(account.avatar) : CUSTOM_IMAGES["control-center"].src,
     account.avatar ? avatarFallback(account.avatar) : CUSTOM_IMAGES["control-center"].fallback,
   );
-  document.getElementById("active-name").textContent = account.display_name || "暂无娃娃账号";
+  document.getElementById("active-name").textContent = account.display_name || "暂无孩子账号";
   document.getElementById("active-username").textContent = account.username ? `账号：${account.username}` : "";
   document.getElementById("active-account-kicker").textContent = user.role === "admin" ? "当前操作对象" : "我的账号";
   document.getElementById("total-points").textContent = Number(data.total_points || 0).toLocaleString("zh-CN");
-  document.getElementById("earn-target-name").textContent = account.display_name || "暂无娃娃账号";
-  document.getElementById("deduct-target-name").textContent = account.display_name || "暂无娃娃账号";
+  document.getElementById("total-money").textContent = `折合 ${moneyText(data.total_points)}`;
+  document.getElementById("earn-target-name").textContent = account.display_name || "暂无孩子账号";
+  document.getElementById("deduct-target-name").textContent = account.display_name || "暂无孩子账号";
   document.getElementById("pending-action-label").textContent = `${pending} 条待处理`;
   document.querySelector(".hero-actions.admin-only")?.classList.toggle("hidden", user.role !== "admin" || !hasChild);
   document.getElementById("no-child-panel")?.classList.toggle("hidden", !(user.role === "admin" && !hasChild));
   const metrics = user.role === "admin" ? [
-    ["娃娃账户", children.length, "个", "metric-green"],
+    ["孩子账户", children.length, "个", "metric-green"],
     ["家庭总积分", children.reduce((sum, item) => sum + Number(item.total_points), 0), "分", "metric-blue"],
     ["待审核申请", pending, "条", pending ? "metric-orange" : "metric-green"],
     ["本周变化", signed(weekTotal), "分", weekTotal >= 0 ? "metric-green" : "metric-red"],
@@ -265,13 +317,14 @@ function renderHome() {
   const controlTotalPoints = document.getElementById("control-total-points");
   const controlPendingCount = document.getElementById("control-pending-count");
   if (controlTitle) controlTitle.textContent = hasChild ? `${account.display_name} 的积分中枢` : "家庭积分中枢";
-  if (controlSubtitle) controlSubtitle.textContent = hasChild ? `当前监控 ${account.username || "娃娃账号"}，可立即执行家庭规则` : "先创建娃娃账号，再开始家庭积分管理";
+  if (controlSubtitle) controlSubtitle.textContent = hasChild ? `当前监控 ${account.username || "孩子账号"}，可立即执行家庭规则` : "先创建孩子账号，再开始家庭积分管理";
   if (controlChildCount) controlChildCount.textContent = children.length;
   if (controlTotalPoints) controlTotalPoints.textContent = children.reduce((sum, item) => sum + Number(item.total_points), 0).toLocaleString("zh-CN");
+  if (document.getElementById("control-total-money")) document.getElementById("control-total-money").textContent = moneyText(children.reduce((sum, item) => sum + Number(item.total_points), 0));
   if (controlPendingCount) controlPendingCount.textContent = pending;
   const homeSummary = document.getElementById("home-account-summary");
   if (homeSummary) {
-    homeSummary.innerHTML = children.length ? children.map((child) => `<tr><td><div class="table-person">${avatarImage(child.avatar, "avatar avatar-table", child.display_name)}<div><strong>${escapeHtml(child.display_name)}</strong><small>${escapeHtml(child.username)}</small></div></div></td><td class="table-number">${Number(child.total_points).toLocaleString("zh-CN")}</td><td class="table-number ${Number(child.today_net) >= 0 ? "income" : "expense"}">${signed(child.today_net)}</td><td><span class="pending-badge">${Number(child.pending_count)}</span></td><td><span class="status-pill ${Number(child.pending_count) ? "status-pending" : "status-approved"}">${Number(child.pending_count) ? "待审核" : "运行正常"}</span></td></tr>`).join("") : `<tr><td colspan="5"><div class="empty-state">暂无娃娃账号，请先创建账号</div></td></tr>`;
+    homeSummary.innerHTML = children.length ? children.map((child) => `<tr><td><div class="table-person">${avatarImage(child.avatar, "avatar avatar-table", child.display_name)}<div><strong>${escapeHtml(child.display_name)}</strong><small>${escapeHtml(child.username)}</small></div></div></td><td class="table-number">${Number(child.total_points).toLocaleString("zh-CN")}</td><td class="table-number">${moneyText(child.total_points)}</td><td class="table-number ${Number(child.today_net) >= 0 ? "income" : "expense"}">${signed(child.today_net)}</td><td><span class="pending-badge">${Number(child.pending_count)}</span></td><td><span class="status-pill ${Number(child.pending_count) ? "status-pending" : "status-approved"}">${Number(child.pending_count) ? "待审核" : "运行正常"}</span></td></tr>`).join("") : `<tr><td colspan="6"><div class="empty-state">暂无孩子账号，请先创建账号</div></td></tr>`;
   }
   renderWeekGrid(document.getElementById("home-week-grid"), "home-week-title");
   const preview = document.getElementById("home-request-preview");
@@ -302,7 +355,7 @@ function renderItemList(container, items, kind, mode) {
   const actionText = isExchange ? "申请兑换" : mode === "child" ? "申请" : kind === "earn" ? "加分" : "扣分";
   const actionClass = kind === "deduct" ? "button-danger" : isExchange ? "button-dark" : "button-primary";
   const pointSign = kind === "deduct" || isExchange ? "-" : "+";
-    container.innerHTML = items.map((item) => `<div class="list-row"><div class="item-info"><div class="project-visual-wrap">${itemIllustration(item.icon, kind)}</div><div><strong>${escapeHtml(item.name)}</strong><span class="item-points ${kind === "deduct" || isExchange ? "expense" : "income"}">${pointSign}${Math.abs(Number(item.points))} 积分</span></div></div><button class="button button-small ${actionClass}" data-action="${kind}" data-id="${item.id}" type="button">${actionText}</button></div>`).join("");
+  container.innerHTML = items.map((item) => `<div class="list-row"><div class="item-info"><div class="project-visual-wrap">${itemIllustration(item.icon, kind)}</div><div><strong>${escapeHtml(item.name)}</strong><span class="item-points ${kind === "deduct" || isExchange ? "expense" : "income"}">${pointSign}${pointsText(Math.abs(Number(item.points)))}</span></div></div><button class="button button-small ${actionClass}" data-action="${kind}" data-id="${item.id}" type="button">${actionText}</button></div>`).join("");
 }
 
 function renderManagement() {
@@ -315,22 +368,22 @@ function renderManageList(elementId, items, kind) {
   const container = document.getElementById(elementId);
   if (!container) return;
   const isExpense = kind === "deduct" || kind === "reward";
-  container.innerHTML = items.length ? items.map((item) => `<div class="list-row"><div class="item-info"><div class="project-visual-wrap">${itemIllustration(item.icon, kind)}</div><div><strong>${escapeHtml(item.name)}</strong><span class="item-points ${isExpense ? "expense" : "income"}">${isExpense ? "-" : "+"}${Math.abs(Number(item.points))} 积分</span></div></div><div class="row-actions"><button class="button button-small button-outline" data-action="edit" data-kind="${kind}" data-id="${item.id}" type="button">编辑</button><button class="button button-small button-outline-danger" data-action="delete" data-kind="${kind}" data-id="${item.id}" type="button">删除</button></div></div>`).join("") : `<div class="empty-state">暂无项目</div>`;
+  container.innerHTML = items.length ? items.map((item) => `<div class="list-row"><div class="item-info"><div class="project-visual-wrap">${itemIllustration(item.icon, kind)}</div><div><strong>${escapeHtml(item.name)}</strong><span class="item-points ${isExpense ? "expense" : "income"}">${isExpense ? "-" : "+"}${pointsText(Math.abs(Number(item.points)))}</span></div></div><div class="row-actions"><button class="button button-small button-outline" data-action="edit" data-kind="${kind}" data-id="${item.id}" type="button">编辑</button><button class="button button-small button-outline-danger" data-action="delete" data-kind="${kind}" data-id="${item.id}" type="button">删除</button></div></div>`).join("") : `<div class="empty-state">暂无项目</div>`;
 }
 
 function requestMarkup(request) {
   const statusText = { pending: "待审核", approved: "已通过", rejected: "已拒绝" };
-  const kindText = { earn: "赚取申请", exchange: "兑换申请", deduct: "扣分申请", manual: "补录申请" };
+  const kindText = { earn: "赚取申请", exchange: "兑换申请", cash_exchange: "现金兑换", deduct: "扣分申请", manual: "补录申请" };
   const status = request.status || "pending";
   const childAvatar = request.child_avatar || "boy";
   const action = appState.data.user.role === "admin" && status === "pending" ? `<div class="row-actions"><button class="button button-small button-primary" data-action="approve-request" data-id="${request.id}" type="button">通过</button><button class="button button-small button-outline-danger" data-action="reject-request" data-id="${request.id}" type="button">拒绝</button></div>` : `<span class="status-pill status-${status}">${statusText[status] || status}</span>`;
-  return `<div class="request-row"><div class="request-person">${avatarImage(childAvatar, "avatar avatar-small", request.child_name || "娃娃")}<div><strong>${escapeHtml(kindText[request.kind] || "积分申请")}：${escapeHtml(request.title)}</strong><span>${appState.data.user.role === "admin" ? `${escapeHtml(request.child_name || "娃娃")} · ` : ""}${escapeHtml(request.date)} ${escapeHtml(request.time)}</span>${status === "rejected" && request.reject_reason ? `<em>${escapeHtml(request.reject_reason)}</em>` : ""}</div></div><strong class="request-amount ${Number(request.amount) >= 0 ? "income" : "expense"}">${signed(request.amount)} 分</strong>${action}</div>`;
+  return `<div class="request-row"><div class="request-person">${avatarImage(childAvatar, "avatar avatar-small", request.child_name || "孩子")}<div><strong>${escapeHtml(kindText[request.kind] || "积分申请")}：${escapeHtml(request.title)}</strong><span>${appState.data.user.role === "admin" ? `${escapeHtml(request.child_name || "孩子")} · ` : ""}${escapeHtml(request.date)} ${escapeHtml(request.time)}</span>${status === "rejected" && request.reject_reason ? `<em>${escapeHtml(request.reject_reason)}</em>` : ""}</div></div><strong class="request-amount ${Number(request.amount) >= 0 ? "income" : "expense"}">${signed(request.amount)} 分</strong>${action}</div>`;
 }
 
 function renderRequests() {
   const isAdmin = appState.data.user.role === "admin";
   document.getElementById("requests-title").textContent = isAdmin ? "审核申请" : "我的申请";
-  document.getElementById("requests-subtitle").textContent = isAdmin ? "娃娃提交的赚分或兑换申请，审核后才会更新余额。" : "申请不会直接改变余额，等待管理账号审核。";
+  document.getElementById("requests-subtitle").textContent = isAdmin ? "孩子提交的赚分或兑换申请，审核后才会更新余额。" : "申请不会直接改变余额，等待管理账号审核。";
   const requests = appState.data.requests || [];
   document.getElementById("requests-list").innerHTML = requests.length ? requests.map(requestMarkup).join("") : `<div class="empty-state">暂无申请记录</div>`;
 }
@@ -345,10 +398,10 @@ function renderAccounts() {
     const isChild = account.role === "child";
     const deleteButton = Number(account.id) === currentId ? "" : `<button class="button button-small button-outline-danger" data-action="delete-account" data-id="${account.id}" type="button">删除</button>`;
     const action = `<div class="row-actions"><button class="button button-small button-outline" data-action="edit-account" data-id="${account.id}" type="button">编辑</button>${deleteButton}</div>`;
-    return `<tr><td><div class="table-person">${avatarImage(account.avatar, "avatar avatar-table", account.display_name)}<div><strong>${escapeHtml(account.display_name)}</strong><small>${escapeHtml(account.avatar === "girl" ? "女孩头像" : account.avatar === "boy" ? "男孩头像" : "管理头像")}</small></div></div></td><td>${escapeHtml(account.username)}</td><td>${isChild ? "娃娃账号" : "管理账号"}</td><td class="table-number">${Number(account.total_points).toLocaleString("zh-CN")}</td><td class="table-number ${Number(account.today_net) >= 0 ? "income" : "expense"}">${signed(account.today_net)}</td><td><span class="pending-badge">${Number(account.pending_count)}</span></td><td>${action}</td></tr>`;
-  }).join("") : `<tr><td colspan="7"><div class="empty-state">暂无账号</div></td></tr>`;
-  const actionText = { create_child: "新增娃娃", create_admin: "新增管理", update_child: "修改娃娃资料", update_admin: "修改管理资料", delete_child: "删除娃娃", delete_admin: "删除管理" };
-  logBody.innerHTML = (appState.data.account_logs || []).length ? appState.data.account_logs.map((log) => `<tr><td>${displayDateTime(log.created_at)}</td><td><div class="table-person">${avatarImage(log.actor_avatar, "avatar avatar-table", log.actor_name)}<strong>${escapeHtml(log.actor_name)}</strong></div></td><td><span class="log-action ${log.target_role === "admin" ? "admin" : "child"}">${actionText[log.action] || escapeHtml(log.action)}</span></td><td><div class="table-person">${avatarImage(log.target_avatar, "avatar avatar-table", log.target_name)}<div><strong>${escapeHtml(log.target_name)}</strong><small>${escapeHtml(log.target_username)}</small></div></div></td><td>${log.target_role === "admin" ? "管理账号" : "娃娃账号"}</td></tr>`).join("") : `<tr><td colspan="5"><div class="empty-state">暂无账号变更记录</div></td></tr>`;
+    return `<tr><td><div class="table-person">${avatarImage(account.avatar, "avatar avatar-table", account.display_name)}<div><strong>${escapeHtml(account.display_name)}</strong><small>${escapeHtml(account.avatar === "girl" ? "女孩头像" : account.avatar === "boy" ? "男孩头像" : "管理头像")}</small></div></div></td><td>${escapeHtml(account.username)}</td><td>${isChild ? "孩子账号" : "管理账号"}</td><td class="table-number">${Number(account.total_points).toLocaleString("zh-CN")}</td><td class="table-number">${moneyText(account.total_points)}</td><td class="table-number ${Number(account.today_net) >= 0 ? "income" : "expense"}">${signed(account.today_net)}</td><td><span class="pending-badge">${Number(account.pending_count)}</span></td><td>${action}</td></tr>`;
+  }).join("") : `<tr><td colspan="8"><div class="empty-state">暂无账号</div></td></tr>`;
+  const actionText = { create_child: "新增孩子", register_child: "孩子自助注册", create_admin: "新增管理", update_child: "修改孩子资料", update_admin: "修改管理资料", delete_child: "删除孩子", delete_admin: "删除管理", change_password: "孩子修改密码" };
+  logBody.innerHTML = (appState.data.account_logs || []).length ? appState.data.account_logs.map((log) => `<tr><td>${displayDateTime(log.created_at)}</td><td><div class="table-person">${avatarImage(log.actor_avatar, "avatar avatar-table", log.actor_name)}<strong>${escapeHtml(log.actor_name)}</strong></div></td><td><span class="log-action ${log.target_role === "admin" ? "admin" : "child"}">${actionText[log.action] || escapeHtml(log.action)}</span></td><td><div class="table-person">${avatarImage(log.target_avatar, "avatar avatar-table", log.target_name)}<div><strong>${escapeHtml(log.target_name)}</strong><small>${escapeHtml(log.target_username)}</small></div></div></td><td>${log.target_role === "admin" ? "管理账号" : "孩子账号"}</td></tr>`).join("") : `<tr><td colspan="5"><div class="empty-state">暂无账号变更记录</div></td></tr>`;
 }
 
 function renderWeekGrid(container, titleId) {
@@ -400,7 +453,8 @@ function openEditor(kind, id = null) {
   appState.editorKind = kind;
   appState.editorId = id;
   const item = id ? findItem(kind, id) : null;
-  appState.selectedIcon = item?.icon || DEFAULT_ITEM_ICONS[kind];
+  const itemIconKnown = Boolean(item?.icon && PROJECT_ICONS.some(([file]) => file === item.icon));
+  appState.selectedIcon = itemIconKnown ? item.icon : DEFAULT_ITEM_ICONS[kind];
   document.getElementById("modal-title").textContent = `${item ? "编辑" : "新增"}${kind === "earn" ? "加分项目" : kind === "reward" ? "兑换奖励" : "扣分项目"}`;
   document.getElementById("editor-name").value = item?.name || "";
   document.getElementById("editor-points").value = item ? Math.abs(Number(item.points)) : "";
@@ -456,8 +510,14 @@ function openEditAccount(id) {
   showModal("account-form");
 }
 
+function openSelfPassword() {
+  const form = document.getElementById("self-password-form");
+  form.reset();
+  showModal("self-password-form");
+}
+
 function showModal(formId) {
-  ["editor-form", "manual-form", "account-form", "confirm-modal"].forEach((id) => document.getElementById(id).classList.toggle("hidden", id !== formId));
+  ["editor-form", "manual-form", "account-form", "self-password-form", "confirm-modal"].forEach((id) => document.getElementById(id).classList.toggle("hidden", id !== formId));
   document.getElementById("modal-backdrop").classList.remove("hidden");
 }
 
@@ -517,13 +577,62 @@ async function saveAccount(event) {
   } catch (error) { showToast(error.message); }
 }
 
+async function saveSelfPassword(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (form.elements.password.value !== form.elements.password_confirm.value) {
+    showToast("两次输入的新密码不一致");
+    return;
+  }
+  try {
+    await api("/api/auth/password", {
+      method: "PUT",
+      body: JSON.stringify({
+        current_password: form.elements.current_password.value,
+        password: form.elements.password.value,
+        password_confirm: form.elements.password_confirm.value,
+      }),
+    });
+    closeModal();
+    showToast("密码已修改");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function updateCashExchangePreview() {
+  const input = document.querySelector("#cash-exchange-form input[name='points']");
+  const preview = document.getElementById("cash-exchange-preview");
+  if (input && preview) preview.textContent = `折合 ${moneyText(input.value)}`;
+}
+
+async function saveCashExchange(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const points = Number(form.elements.points.value);
+  if (!Number.isInteger(points) || points <= 0) {
+    showToast("请输入有效兑换积分");
+    return;
+  }
+  try {
+    const result = await api("/api/transactions", { method: "POST", body: JSON.stringify({ kind: "cash_exchange", points }) });
+    appState.data = result;
+    form.reset();
+    updateCashExchangePreview();
+    render();
+    showToast("现金兑换申请已提交，等待管理账号审核");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 async function deleteAccount(id) {
   if (!await requestConfirm("删除账号会同时删除积分和记录，确定继续吗？", { title: "删除账号", confirmLabel: "删除账号" })) return;
   try { await api(`/api/accounts/${id}`, { method: "DELETE" }); await loadState(); navigate("accounts"); showToast("账号已删除"); } catch (error) { showToast(error.message); }
 }
 
 async function reviewRequest(action, id) {
-  const message = action === "approve" ? "通过后积分会立即计入娃娃余额，确定吗？" : "确定拒绝这条申请吗？";
+  const message = action === "approve" ? "通过后积分会立即计入孩子余额，确定吗？" : "确定拒绝这条申请吗？";
   if (!await requestConfirm(message, { title: action === "approve" ? "通过申请" : "拒绝申请", confirmLabel: action === "approve" ? "通过" : "拒绝", danger: action !== "approve" })) return;
   try {
     appState.data = await api(`/api/requests/${id}/${action}`, { method: "POST", body: JSON.stringify(action === "reject" ? { reason: "管理账号拒绝了这条申请" } : {}) });
@@ -548,7 +657,7 @@ async function handleOperation(kind, id = null, form = null) {
   appState.data = result;
   if (form) form.reset();
   render();
-  showToast(result.request_submitted ? "申请已提交，等待管理账号审核" : kind === "earn" ? "已给娃娃加分" : kind === "exchange" ? "兑换已提交，等待管理账号审核" : "已扣取娃娃积分");
+  showToast(result.request_submitted ? "申请已提交，等待管理账号审核" : kind === "earn" ? "已给孩子加分" : kind === "exchange" ? "兑换已提交，等待管理账号审核" : "已扣取孩子积分");
 }
 
 async function saveEditor(event) {
@@ -563,6 +672,23 @@ async function saveEditor(event) {
     await loadState();
     showToast(appState.editorId ? "项目已更新" : "项目已添加");
   } catch (error) { showToast(error.message); }
+}
+
+async function saveCurrencySettings(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const pointsPerYuan = Number(form.elements.points_per_yuan.value);
+  if (!Number.isInteger(pointsPerYuan) || pointsPerYuan < 1 || pointsPerYuan > 1000000) {
+    showToast("换算比例必须是 1 到 1000000 的整数");
+    return;
+  }
+  try {
+    appState.data = await api("/api/settings", { method: "PUT", body: JSON.stringify({ points_per_yuan: pointsPerYuan }) });
+    render();
+    showToast("换钱比例已保存");
+  } catch (error) {
+    showToast(error.message);
+  }
 }
 
 async function saveManual(event) {
@@ -644,6 +770,33 @@ document.getElementById("login-form").addEventListener("submit", async (event) =
   } catch (error) { document.getElementById("login-error").textContent = error.message; }
 });
 
+document.getElementById("child-register-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const error = document.getElementById("child-register-error");
+  error.textContent = "";
+  if (form.elements.password.value !== form.elements.password_confirm.value) {
+    error.textContent = "两次输入的密码不一致";
+    return;
+  }
+  try {
+    await api("/api/auth/register-child", {
+      method: "POST",
+      body: JSON.stringify({
+        username: form.elements.username.value.trim(),
+        display_name: form.elements.display_name.value.trim(),
+        password: form.elements.password.value,
+        password_confirm: form.elements.password_confirm.value,
+        avatar: form.elements.avatar.value,
+      }),
+    });
+    form.reset();
+    await loadState();
+  } catch (requestError) {
+    error.textContent = requestError.message;
+  }
+});
+
 document.getElementById("setup-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -672,8 +825,15 @@ document.getElementById("setup-form").addEventListener("submit", async (event) =
 document.getElementById("editor-form").addEventListener("submit", saveEditor);
 document.getElementById("manual-form").addEventListener("submit", saveManual);
 document.getElementById("account-form").addEventListener("submit", saveAccount);
+document.getElementById("self-password-form").addEventListener("submit", saveSelfPassword);
+document.getElementById("currency-form").addEventListener("submit", saveCurrencySettings);
+document.getElementById("cash-exchange-form").addEventListener("submit", saveCashExchange);
+document.querySelector("#cash-exchange-form input[name='points']").addEventListener("input", updateCashExchangePreview);
 document.getElementById("open-account").addEventListener("click", openAccount);
 document.getElementById("open-manual").addEventListener("click", openManual);
+document.getElementById("open-self-password").addEventListener("click", openSelfPassword);
+document.getElementById("open-child-register").addEventListener("click", showChildRegister);
+document.getElementById("back-to-login").addEventListener("click", showLogin);
 document.getElementById("account-form").elements.role.addEventListener("change", (event) => fillAvatarOptions(event.target.value));
 document.getElementById("logout-button").addEventListener("click", async () => { try { await api("/api/auth/logout", { method: "POST" }); } finally { showLogin(); } });
 document.getElementById("child-select").addEventListener("change", async (event) => {
@@ -689,12 +849,12 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !document.getElementById("modal-backdrop").classList.contains("hidden")) closeModal();
 });
 document.getElementById("clear-points").addEventListener("click", async () => {
-  if (!await requestConfirm("确定清空当前娃娃的全部积分记录吗？", { title: "清空积分记录", confirmLabel: "清空记录" })) return;
+  if (!await requestConfirm("确定清空当前孩子的全部积分记录吗？", { title: "清空积分记录", confirmLabel: "清空记录" })) return;
   try { appState.data = await api("/api/system/clear", { method: "POST" }); render(); showToast("积分记录已清空"); } catch (error) { showToast(error.message); }
 });
 document.getElementById("reset-system").addEventListener("click", async () => {
-  if (!await requestConfirm("确定恢复当前娃娃的默认设置吗？", { title: "恢复默认设置", confirmLabel: "恢复默认" })) return;
-  try { appState.data = await api("/api/system/reset", { method: "POST" }); render(); showToast("当前娃娃已恢复默认设置"); } catch (error) { showToast(error.message); }
+  if (!await requestConfirm("确定恢复当前孩子的默认设置吗？", { title: "恢复默认设置", confirmLabel: "恢复默认" })) return;
+  try { appState.data = await api("/api/system/reset", { method: "POST" }); render(); showToast("当前孩子已恢复默认设置"); } catch (error) { showToast(error.message); }
 });
 
 loadState();
