@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.18 - 2026-08-09
+
+- Merge remote-tracking branch 'origin/main' into codex/binary-deployment (6765304)
+- feat: add child self-registration and cash exchange (fa6e358)
+
 ## v0.6.17 - 2026-08-07
 
 - fix: apply install wizard admin credentials (7e9db29)
