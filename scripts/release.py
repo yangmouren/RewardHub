@@ -29,11 +29,19 @@ def latest_tag() -> str:
     return next((tag for tag in tags if TAG_PATTERN.fullmatch(tag)), "")
 
 
+def version_tuple(version: str) -> tuple[int, int, int]:
+    return tuple(int(part) for part in version.split("."))
+
+
 def next_version() -> str:
+    current = current_version()
     tag = latest_tag()
     if not tag:
-        return current_version()
+        return current
     major, minor, patch = TAG_PATTERN.fullmatch(tag).groups()
+    tagged = f"{major}.{minor}.{patch}"
+    if version_tuple(current) > version_tuple(tagged):
+        return current
     return f"{major}.{minor}.{int(patch) + 1}"
 
 
