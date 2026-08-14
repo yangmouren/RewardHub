@@ -2,6 +2,13 @@
 
 ## v0.7.0 - 2026-08-14
 
+- fix: release without hardcoded template version (14ae04b)
+- release: prepare RewardHub v0.7.0 (1abe96c)
+- Merge remote-tracking branch 'origin/main' into codex/binary-deployment (9903516)
+- feat: improve announcements and cash exchange preview (c40752b)
+
+## v0.7.0 - 2026-08-14
+
 - 增加 RPG 任务悬赏、日常任务和史诗悬赏。
 - 增加经验值、冒险等级、等级特权和成就勋章。
 - 增加首页通知、孩子端通知弹窗和任务完成审核。
