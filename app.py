@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import math
 import os
 import re
 import secrets
@@ -27,7 +28,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", str(DEFAULT_DATA_DIR)))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(DATA_DIR / "points.db")))
 SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-key-in-production")
 PASSWORD_ITERATIONS = 240_000
-APP_VERSION = "0.6.18"
+APP_VERSION = "0.7.0"
 AVATAR_OPTIONS = {"boy", "girl", "adult-male", "adult-female"}
 CHILD_AVATARS = {"boy", "girl"}
 PROJECT_ICONS = {
@@ -37,14 +38,49 @@ PROJECT_ICONS = {
     "phone.svg", "cooking.svg", "cleaning.svg", "school.svg", "toothbrush.svg",
     "bath.svg", "pencil.svg", "clothes.svg", "laundry.svg", "dishes.svg",
     "pet.svg", "walk.svg", "shopping.svg", "backpack.svg", "handwash.svg",
-    "water.svg", "plant.svg", "tidy.svg", "trash.svg", "lunch.svg",
+    "water.svg", "plant.svg", "tidy.svg", "trash.svg", "lunch.svg", "delivery.svg",
 }
+BUILTIN_ICON_KEYS = set(
+    """
+    home broom vacuum clean tidy trash laundry dishes clothes iron bed sleep alarm shower toothbrush handwash bath repair hammer screwdriver
+    cooking meal breakfast lunch dinner bread rice noodles apple banana orange strawberry cake cookie milk water coffee tea juice snack icecream
+    homework book reading pencil school graduation math science language art music idea microscope ruler notebook library exam medal target lightbulb
+    sport run walk bike swim football basketball baseball tennis badminton yoga weight hiking mountain trophy whistle skate climbing fitness stretch
+    car bus train airplane rocket ship taxi bicycle map location suitcase passport ticket traffic fuel travel compass road parking delivery
+    family child baby adult dog cat pet plant flower birthday heart homekey door sofa tv camera phone calendar couple
+    nas server harddrive folder cloud download upload wifi network database terminal code keyboard printer tablet desktop computer smartphone gamepad
+    office briefcase clock chart mail meeting call checklist pin note moneybag contract build manager megaphone bell search settings shield lock
+    coin money diamond crown badge star fire bolt gem treasure giftbox fireworks crown2 medal2
+    doctor medicine hospital mask bandage thermometer apple2 water2 heart2 brain lungs health firstaid rest
+    sun moon cloud2 rain snow rainbow wind leaf tree flower2 season umbrella temperature earth
+    party confetti balloon cake2 music2 flag community handshake speech message announcement megaphone2 group friend smile package
+    """.split()
+)
 ITEM_DEFAULT_ICONS = {"earn": "points.svg", "deduct": "warning.svg", "reward": "gift.svg"}
 DEFAULT_SETTINGS = {"points_per_yuan": 100}
+TASK_TYPES = {"daily", "epic"}
+TASK_DIFFICULTIES = {"easy", "normal", "hard", "legendary"}
+DEFAULT_ACHIEVEMENTS = [
+    ("first-quest", "初次出征", "完成第一个现实任务", "points.svg", "completed_tasks", 1),
+    ("habit-builder", "习惯养成", "完成 3 个任务，建立自己的节奏", "bedtime.svg", "completed_tasks", 3),
+    ("quest-ten", "十次出征", "完成 10 个任务，成为可靠的冒险者", "backpack.svg", "completed_tasks", 10),
+    ("quest-twenty-five", "任务老手", "完成 25 个任务，持续兑现自己的目标", "points.svg", "completed_tasks", 25),
+    ("epic-clear", "史诗征服者", "完成第一个史诗悬赏", "gift.svg", "epic_tasks", 1),
+    ("epic-trio", "史诗远征队", "完成 3 个史诗悬赏", "gift.svg", "epic_tasks", 3),
+    ("epic-five", "传奇开拓者", "完成 5 个史诗悬赏", "gift.svg", "epic_tasks", 5),
+    ("coin-hoard", "积分收藏家", "累计赚取 100 积分", "money.svg", "earned_coins", 100),
+    ("coin-five-hundred", "积分宝库", "累计赚取 500 积分", "money.svg", "earned_coins", 500),
+    ("coin-thousand", "财富领航员", "累计赚取 1000 积分", "money.svg", "earned_coins", 1000),
+    ("daily-five", "日常坚持者", "完成 5 个日常任务", "bedtime.svg", "daily_tasks", 5),
+]
 
 
 def valid_project_icon(icon: str | None) -> bool:
-    return isinstance(icon, str) and icon in PROJECT_ICONS
+    if not isinstance(icon, str):
+        return False
+    if icon in PROJECT_ICONS:
+        return True
+    return icon.startswith("emoji:") and icon[6:] in BUILTIN_ICON_KEYS
 
 DEFAULT_EARN_ITEMS = [
     ("完成作业", 10, "homework.svg"),
@@ -401,6 +437,60 @@ def init_db() -> None:
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '生活',
+                task_type TEXT NOT NULL CHECK (task_type IN ('daily', 'epic')),
+                difficulty TEXT NOT NULL DEFAULT 'normal' CHECK (difficulty IN ('easy', 'normal', 'hard', 'legendary')),
+                reward_coins INTEGER NOT NULL CHECK (reward_coins > 0),
+                reward_exp INTEGER NOT NULL CHECK (reward_exp > 0),
+                icon TEXT NOT NULL DEFAULT 'points.svg',
+                due_date TEXT,
+                created_by INTEGER NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS task_assignments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'claimed' CHECK (status IN ('claimed', 'submitted', 'completed', 'rejected')),
+                claim_date TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                submitted_at TEXT,
+                completed_at TEXT,
+                reviewer_id INTEGER,
+                review_note TEXT,
+                UNIQUE(task_id, account_id, claim_date)
+            );
+            CREATE TABLE IF NOT EXISTS achievements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                achievement_key TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                icon TEXT NOT NULL DEFAULT 'gift.svg',
+                requirement_type TEXT NOT NULL,
+                requirement_value INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS account_achievements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                achievement_id INTEGER NOT NULL,
+                unlocked_at TEXT NOT NULL,
+                UNIQUE(account_id, achievement_id)
+            );
+            CREATE TABLE IF NOT EXISTS announcements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                audience TEXT NOT NULL DEFAULT 'all' CHECK (audience IN ('all', 'children')),
+                created_by INTEGER NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         migrate_point_requests(conn)
@@ -427,6 +517,23 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO app_settings(key, value, updated_at) VALUES (?, ?, ?)",
             ("points_per_yuan", str(DEFAULT_SETTINGS["points_per_yuan"]), datetime.now().astimezone().isoformat(timespec="seconds")),
         )
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO achievements(
+                achievement_key, title, description, icon, requirement_type, requirement_value
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            DEFAULT_ACHIEVEMENTS,
+        )
+        for achievement_key, title, description, icon, requirement_type, requirement_value in DEFAULT_ACHIEVEMENTS:
+            conn.execute(
+                """
+                UPDATE achievements
+                SET title = ?, description = ?, icon = ?, requirement_type = ?, requirement_value = ?
+                WHERE achievement_key = ?
+                """,
+                (title, description, icon, requirement_type, requirement_value, achievement_key),
+            )
 
         credentials = admin_credentials_from_env()
         if credentials and not install_credentials_are_applied(credentials):
@@ -480,8 +587,73 @@ def points_per_yuan(conn: sqlite3.Connection) -> int:
     return rate if rate > 0 else DEFAULT_SETTINGS["points_per_yuan"]
 
 
-def settings_payload(conn: sqlite3.Connection) -> dict[str, Any]:
-    return {"points_per_yuan": points_per_yuan(conn)}
+def adventure_level_key(account_id: int) -> str:
+    return f"adventure_level:{int(account_id)}"
+
+
+def manual_adventure_level(conn: sqlite3.Connection, account_id: int | None) -> int | None:
+    if account_id is None:
+        return None
+    row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (adventure_level_key(account_id),)).fetchone()
+    try:
+        level = int(row["value"]) if row else 0
+    except (TypeError, ValueError):
+        return None
+    return level if 1 <= level <= 99 else None
+
+
+def calculated_adventure_level(conn: sqlite3.Connection, account_id: int | None) -> int:
+    if account_id is None:
+        return 1
+    experience = int(
+        conn.execute(
+            """
+            SELECT COALESCE(SUM(t.reward_exp), 0)
+            FROM task_assignments ta
+            JOIN tasks t ON t.id = ta.task_id
+            WHERE ta.account_id = ? AND ta.status = 'completed'
+            """,
+            (account_id,),
+        ).fetchone()[0]
+    )
+    return experience // 100 + 1
+
+
+def adventure_level_for(conn: sqlite3.Connection, account_id: int | None) -> int:
+    return manual_adventure_level(conn, account_id) or calculated_adventure_level(conn, account_id)
+
+
+def adventure_benefits(conn: sqlite3.Connection, account_id: int | None) -> dict[str, Any]:
+    level = adventure_level_for(conn, account_id)
+    steps = min(max(level - 1, 0), 20)
+    earn_bonus_percent = steps * 5
+    exchange_discount_percent = steps * 2.5
+    return {
+        "level": level,
+        "earn_bonus_percent": earn_bonus_percent,
+        "exchange_discount_percent": exchange_discount_percent,
+        "earn_multiplier": 1 + earn_bonus_percent / 100,
+        "exchange_multiplier": 1 - exchange_discount_percent / 100,
+    }
+
+
+def adjusted_earn_coins(conn: sqlite3.Connection, account_id: int, coins: int) -> int:
+    benefits = adventure_benefits(conn, account_id)
+    return max(1, int(math.ceil(coins * benefits["earn_multiplier"])))
+
+
+def adjusted_exchange_coins(conn: sqlite3.Connection, account_id: int, coins: int) -> int:
+    benefits = adventure_benefits(conn, account_id)
+    return max(1, int(math.floor(coins * benefits["exchange_multiplier"])))
+
+
+def settings_payload(conn: sqlite3.Connection, account_id: int | None = None) -> dict[str, Any]:
+    manual_level = manual_adventure_level(conn, account_id)
+    return {
+        "points_per_yuan": points_per_yuan(conn),
+        "manual_adventure_level": manual_level,
+        "adventure_level_mode": "manual" if manual_level is not None else "auto",
+    }
 
 
 def safe_account(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -557,6 +729,20 @@ def row_item(row: sqlite3.Row, kind: str) -> dict[str, Any]:
     return {"id": row["id"], "name": row["name"], "points": points, "icon": row["icon"] or ITEM_DEFAULT_ICONS[kind]}
 
 
+def child_visible_item(row: sqlite3.Row, kind: str, conn: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]:
+    item = row_item(row, kind)
+    if user["role"] != "child":
+        return item
+    base_points = abs(int(item["points"]))
+    if kind == "earn":
+        item["base_points"] = base_points
+        item["points"] = adjusted_earn_coins(conn, int(user["id"]), base_points)
+    elif kind == "reward":
+        item["base_points"] = base_points
+        item["points"] = adjusted_exchange_coins(conn, int(user["id"]), base_points)
+    return item
+
+
 def get_balance(conn: sqlite3.Connection, account_id: int) -> int:
     return int(
         conn.execute("SELECT COALESCE(SUM(amount), 0) FROM records WHERE account_id = ?", (account_id,)).fetchone()[0]
@@ -619,12 +805,212 @@ def account_log_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def gamification_payload(conn: sqlite3.Connection, account_id: int | None) -> dict[str, Any]:
+    if account_id is None:
+        return {
+            "coins": 0,
+            "experience": 0,
+            "level": 1,
+            "next_level_exp": 100,
+            "completed_tasks": 0,
+            "unlocked_achievements": 0,
+            "level_mode": "auto",
+            "earn_bonus_percent": 0,
+            "exchange_discount_percent": 0,
+        }
+    completed_tasks = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM task_assignments WHERE account_id = ? AND status = 'completed'",
+            (account_id,),
+        ).fetchone()[0]
+    )
+    experience = int(
+        conn.execute(
+            """
+            SELECT COALESCE(SUM(t.reward_exp), 0)
+            FROM task_assignments ta
+            JOIN tasks t ON t.id = ta.task_id
+            WHERE ta.account_id = ? AND ta.status = 'completed'
+            """,
+            (account_id,),
+        ).fetchone()[0]
+    )
+    unlocked = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM account_achievements WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()[0]
+    )
+    benefits = adventure_benefits(conn, account_id)
+    level = benefits["level"]
+    return {
+        "coins": get_balance(conn, account_id),
+        "experience": experience,
+        "level": level,
+        "next_level_exp": level * 100,
+        "completed_tasks": completed_tasks,
+        "unlocked_achievements": unlocked,
+        "level_mode": "manual" if manual_adventure_level(conn, account_id) is not None else "auto",
+        "earn_bonus_percent": benefits["earn_bonus_percent"],
+        "exchange_discount_percent": benefits["exchange_discount_percent"],
+    }
+
+
+def achievement_rows(conn: sqlite3.Connection, account_id: int | None) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT a.id, a.achievement_key, a.title, a.description, a.icon,
+               a.requirement_type, a.requirement_value,
+               aa.unlocked_at
+        FROM achievements a
+        LEFT JOIN account_achievements aa
+          ON aa.achievement_id = a.id AND aa.account_id = ?
+        ORDER BY CASE WHEN aa.unlocked_at IS NULL THEN 1 ELSE 0 END, a.id
+        """,
+        (account_id or 0,),
+    ).fetchall()
+    return [
+        {
+            **dict(row),
+            "unlocked": row["unlocked_at"] is not None,
+        }
+        for row in rows
+    ]
+
+
+def task_assignment_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "account_id": row["account_id"],
+        "account_name": row["account_name"],
+        "account_avatar": row["account_avatar"],
+        "status": row["status"],
+        "claim_date": row["claim_date"],
+        "claimed_at": row["claimed_at"],
+        "submitted_at": row["submitted_at"],
+        "completed_at": row["completed_at"],
+        "review_note": row["review_note"],
+    }
+
+
+def task_rows(conn: sqlite3.Connection, user: sqlite3.Row) -> list[dict[str, Any]]:
+    tasks = conn.execute(
+        """
+        SELECT t.*, a.display_name AS creator_name
+        FROM tasks t
+        LEFT JOIN accounts a ON a.id = t.created_by
+        WHERE t.is_active = 1
+        ORDER BY CASE t.task_type WHEN 'epic' THEN 0 ELSE 1 END, t.id DESC
+        """
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for task in tasks:
+        assignments = conn.execute(
+            """
+            SELECT ta.*, a.display_name AS account_name, a.avatar AS account_avatar
+            FROM task_assignments ta
+            JOIN accounts a ON a.id = ta.account_id
+            WHERE ta.task_id = ?
+            ORDER BY ta.id DESC
+            """,
+            (task["id"],),
+        ).fetchall()
+        own = next(
+            (row for row in assignments if int(row["account_id"]) == int(user["id"])),
+            None,
+        )
+        result.append(
+            {
+                "id": task["id"],
+                "title": task["title"],
+                "description": task["description"],
+                "category": task["category"],
+                "task_type": task["task_type"],
+                "difficulty": task["difficulty"],
+                "reward_coins": adjusted_earn_coins(conn, int(user["id"]), int(task["reward_coins"])) if user["role"] == "child" else task["reward_coins"],
+                "base_reward_coins": task["reward_coins"],
+                "reward_exp": task["reward_exp"],
+                "icon": task["icon"],
+                "due_date": task["due_date"],
+                "creator_name": task["creator_name"] or "管理员",
+                "participant_count": len(assignments),
+                "assignments": [task_assignment_row(row) for row in assignments] if user["role"] == "admin" else [],
+                "my_assignment": task_assignment_row(own) if own is not None else None,
+            }
+        )
+    return result
+
+
+def announcement_rows(conn: sqlite3.Connection, user: sqlite3.Row) -> list[dict[str, Any]]:
+    if user["role"] == "admin":
+        rows = conn.execute(
+            "SELECT * FROM announcements WHERE is_active = 1 ORDER BY id DESC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM announcements WHERE is_active = 1 AND audience IN ('all', 'children') ORDER BY id DESC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def unlock_achievements(conn: sqlite3.Connection, account_id: int) -> None:
+    completed_tasks = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM task_assignments WHERE account_id = ? AND status = 'completed'",
+            (account_id,),
+        ).fetchone()[0]
+    )
+    epic_tasks = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM task_assignments ta
+            JOIN tasks t ON t.id = ta.task_id
+            WHERE ta.account_id = ? AND ta.status = 'completed' AND t.task_type = 'epic'
+            """,
+            (account_id,),
+        ).fetchone()[0]
+    )
+    earned_coins = int(
+        conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM records WHERE account_id = ? AND amount > 0",
+            (account_id,),
+        ).fetchone()[0]
+    )
+    daily_tasks = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM task_assignments ta
+            JOIN tasks t ON t.id = ta.task_id
+            WHERE ta.account_id = ? AND ta.status = 'completed' AND t.task_type = 'daily'
+            """,
+            (account_id,),
+        ).fetchone()[0]
+    )
+    progress = {
+        "completed_tasks": completed_tasks,
+        "epic_tasks": epic_tasks,
+        "earned_coins": earned_coins,
+        "daily_tasks": daily_tasks,
+    }
+    definitions = conn.execute("SELECT * FROM achievements").fetchall()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    for achievement in definitions:
+        if progress.get(achievement["requirement_type"], 0) < achievement["requirement_value"]:
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO account_achievements(account_id, achievement_id, unlocked_at) VALUES (?, ?, ?)",
+            (account_id, achievement["id"], now),
+        )
+
+
 def state_payload(conn: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]:
     account_id = active_child_id(conn, user)
     if account_id is None:
         return {
             "version": APP_VERSION,
-            "settings": settings_payload(conn),
+            "settings": settings_payload(conn, None),
             "user": safe_account(user),
             "children": [],
             "active_child": None,
@@ -635,6 +1021,10 @@ def state_payload(conn: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]
             "rewards": [],
             "records": [],
             "requests": request_rows(conn, user),
+            "tasks": task_rows(conn, user),
+            "announcements": announcement_rows(conn, user),
+            "achievements": achievement_rows(conn, None),
+            "gamification": gamification_payload(conn, None),
             "account_overview": account_overview_rows(conn) if user["role"] == "admin" else [],
             "account_logs": account_log_rows(conn) if user["role"] == "admin" else [],
             "permissions": {
@@ -654,17 +1044,21 @@ def state_payload(conn: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]
     children = conn.execute("SELECT * FROM accounts WHERE role = 'child' AND active = 1 ORDER BY id").fetchall()
     return {
         "version": APP_VERSION,
-        "settings": settings_payload(conn),
+        "settings": settings_payload(conn, account_id),
         "user": safe_account(user),
         "children": [safe_account(row) for row in children],
         "active_child": safe_account(active_child),
         "active_child_id": account_id,
         "total_points": get_balance(conn, account_id),
-        "earn_items": [row_item(row, "earn") for row in earn],
+        "earn_items": [child_visible_item(row, "earn", conn, user) for row in earn],
         "deduct_items": [row_item(row, "deduct") for row in deduct],
-        "rewards": [row_item(row, "reward") for row in rewards],
+        "rewards": [child_visible_item(row, "reward", conn, user) for row in rewards],
         "records": [dict(row) for row in records],
         "requests": request_rows(conn, user),
+        "tasks": task_rows(conn, user),
+        "announcements": announcement_rows(conn, user),
+        "achievements": achievement_rows(conn, account_id),
+        "gamification": gamification_payload(conn, account_id),
         "account_overview": account_overview_rows(conn) if user["role"] == "admin" else [],
         "account_logs": account_log_rows(conn) if user["role"] == "admin" else [],
         "permissions": {
@@ -1006,8 +1400,9 @@ def delete_account(account_id: int):
                 datetime.now().astimezone().isoformat(timespec="seconds"),
             ),
         )
-        for table in ("earn_items", "deduct_items", "rewards", "records", "point_requests"):
+        for table in ("earn_items", "deduct_items", "rewards", "records", "point_requests", "task_assignments", "account_achievements"):
             conn.execute(f"DELETE FROM {table} WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM app_settings WHERE key = ?", (adventure_level_key(account_id),))
         conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
         if session.get("selected_child_id") == account_id:
             session.pop("selected_child_id", None)
@@ -1072,24 +1467,337 @@ def get_state():
 @require_admin
 def update_settings():
     payload = request.get_json(silent=True) or {}
+    rate = None
+    if "points_per_yuan" in payload:
+        try:
+            rate = positive_int(payload.get("points_per_yuan"), "换算比例")
+        except ValueError as exc:
+            return api_error(str(exc))
+        if rate > 1_000_000:
+            return api_error("换算比例不能超过 1000000")
+    if rate is None and "adventure_level" not in payload:
+        return api_error("没有需要保存的设置")
+    with connection() as conn:
+        user = current_user(conn)
+        account_id = active_child_id(conn, user)
+        if "adventure_level" in payload:
+            requested_level = str(payload.get("adventure_level") or "").strip().lower()
+            level_key = adventure_level_key(account_id) if account_id is not None else None
+            if requested_level in ("", "auto"):
+                if level_key:
+                    conn.execute("DELETE FROM app_settings WHERE key = ?", (level_key,))
+            else:
+                try:
+                    level = int(requested_level)
+                except ValueError:
+                    return api_error("冒险等级必须是 1 到 99 的整数，或选择自动计算")
+                if not 1 <= level <= 99:
+                    return api_error("冒险等级必须在 1 到 99 之间")
+                if level_key is None:
+                    return api_error("请先创建并选择孩子账号")
+                conn.execute(
+                    """
+                    INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (level_key, str(level), datetime.now().astimezone().isoformat(timespec="seconds")),
+                )
+        if rate is not None:
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            updated = conn.execute(
+                "UPDATE app_settings SET value = ?, updated_at = ? WHERE key = 'points_per_yuan'",
+                (str(rate), now),
+            )
+            if updated.rowcount == 0:
+                conn.execute(
+                    "INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?)",
+                    ("points_per_yuan", str(rate), now),
+                )
+        return jsonify(state_payload(conn, user))
+
+
+@app.get("/api/tasks")
+@require_user
+def list_tasks():
+    with connection() as conn:
+        user = current_user(conn)
+        account_id = int(user["id"]) if user["role"] == "child" else active_child_id(conn, user)
+        return jsonify(
+            {
+                "tasks": task_rows(conn, user),
+                "achievements": achievement_rows(conn, account_id),
+                "gamification": gamification_payload(conn, account_id),
+            }
+        )
+
+
+@app.post("/api/tasks")
+@require_admin
+def create_task():
+    payload = request.get_json(silent=True) or {}
+    title = str(payload.get("title", "")).strip()[:80]
+    description = str(payload.get("description", "")).strip()[:240]
+    category = str(payload.get("category", "生活")).strip()[:30] or "生活"
+    task_type = str(payload.get("task_type", "daily")).lower()
+    difficulty = str(payload.get("difficulty", "normal")).lower()
+    icon = str(payload.get("icon") or "points.svg")
+    due_date_value = str(payload.get("due_date") or "").strip()
     try:
-        rate = positive_int(payload.get("points_per_yuan"), "换算比例")
+        reward_coins = positive_int(payload.get("reward_coins"), "积分奖励")
+        reward_exp = positive_int(payload.get("reward_exp"), "经验奖励")
+        due_date = valid_date(due_date_value) if due_date_value else None
     except ValueError as exc:
         return api_error(str(exc))
-    if rate > 1_000_000:
-        return api_error("换算比例不能超过 1000000")
+    if not title:
+        return api_error("任务标题不能为空")
+    if task_type not in TASK_TYPES:
+        return api_error("任务类型无效")
+    if difficulty not in TASK_DIFFICULTIES:
+        return api_error("任务难度无效")
+    if not valid_project_icon(icon):
+        return api_error("任务图标无效")
+    with connection() as conn:
+        user = current_user(conn)
+        cursor = conn.execute(
+            """
+            INSERT INTO tasks(
+                title, description, category, task_type, difficulty,
+                reward_coins, reward_exp, icon, due_date, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                title,
+                description,
+                category,
+                task_type,
+                difficulty,
+                reward_coins,
+                reward_exp,
+                icon,
+                due_date,
+                user["id"],
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+            ),
+        )
+        task = conn.execute("SELECT * FROM tasks WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return jsonify({"task": dict(task), "state": state_payload(conn, user)}), 201
+
+
+@app.route("/api/tasks/<int:task_id>", methods=["PUT", "DELETE"])
+@require_admin
+def task_detail(task_id: int):
+    with connection() as conn:
+        user = current_user(conn)
+        task = conn.execute("SELECT * FROM tasks WHERE id = ? AND is_active = 1", (task_id,)).fetchone()
+        if task is None:
+            return api_error("任务不存在", 404)
+        if request.method == "DELETE":
+            conn.execute("UPDATE tasks SET is_active = 0 WHERE id = ?", (task_id,))
+            return jsonify({"deleted": True})
+        payload = request.get_json(silent=True) or {}
+        title = str(payload.get("title", "")).strip()[:80]
+        description = str(payload.get("description", "")).strip()[:240]
+        category = str(payload.get("category", task["category"])).strip()[:30] or "生活"
+        task_type = str(payload.get("task_type", task["task_type"])).lower()
+        difficulty = str(payload.get("difficulty", task["difficulty"])).lower()
+        icon = str(payload.get("icon") or task["icon"])
+        due_date_value = str(payload.get("due_date") or "").strip()
+        try:
+            reward_coins = positive_int(payload.get("reward_coins", task["reward_coins"]), "积分奖励")
+            reward_exp = positive_int(payload.get("reward_exp", task["reward_exp"]), "经验奖励")
+            due_date = valid_date(due_date_value) if due_date_value else None
+        except ValueError as exc:
+            return api_error(str(exc))
+        if not title:
+            return api_error("任务标题不能为空")
+        if task_type not in TASK_TYPES or difficulty not in TASK_DIFFICULTIES:
+            return api_error("任务类型或难度无效")
+        if not valid_project_icon(icon):
+            return api_error("任务图标无效")
+        conn.execute(
+            """
+            UPDATE tasks SET title = ?, description = ?, category = ?, task_type = ?, difficulty = ?,
+                reward_coins = ?, reward_exp = ?, icon = ?, due_date = ?
+            WHERE id = ?
+            """,
+            (title, description, category, task_type, difficulty, reward_coins, reward_exp, icon, due_date, task_id),
+        )
+        return jsonify(state_payload(conn, user))
+
+
+@app.post("/api/tasks/<int:task_id>/claim")
+@require_user
+def claim_task(task_id: int):
+    with connection() as conn:
+        user = current_user(conn)
+        if user["role"] != "child":
+            return api_error("只有孩子账号可以领取任务", 403)
+        task = conn.execute("SELECT * FROM tasks WHERE id = ? AND is_active = 1", (task_id,)).fetchone()
+        if task is None:
+            return api_error("任务不存在", 404)
+        today = current_date()
+        if task["due_date"] and task["due_date"] < today:
+            return api_error("这个任务已经过期", 409)
+        if task["task_type"] == "epic":
+            existing = conn.execute(
+                "SELECT 1 FROM task_assignments WHERE task_id = ? AND account_id = ? AND status IN ('claimed', 'submitted', 'completed')",
+                (task_id, user["id"]),
+            ).fetchone()
+        else:
+            existing = conn.execute(
+                "SELECT 1 FROM task_assignments WHERE task_id = ? AND account_id = ? AND claim_date = ? AND status IN ('claimed', 'submitted', 'completed')",
+                (task_id, user["id"], today),
+            ).fetchone()
+        if existing is not None:
+            return api_error("你已经领取过这个任务", 409)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        cursor = conn.execute(
+            """
+            INSERT INTO task_assignments(task_id, account_id, status, claim_date, claimed_at)
+            VALUES (?, ?, 'claimed', ?, ?)
+            """,
+            (task_id, user["id"], today, now),
+        )
+        return jsonify({"assignment_id": cursor.lastrowid, **state_payload(conn, user)}), 201
+
+
+@app.post("/api/task-assignments/<int:assignment_id>/submit")
+@require_user
+def submit_task(assignment_id: int):
+    with connection() as conn:
+        user = current_user(conn)
+        assignment = conn.execute(
+            "SELECT * FROM task_assignments WHERE id = ? AND account_id = ?",
+            (assignment_id, user["id"]),
+        ).fetchone()
+        if user["role"] != "child" or assignment is None:
+            return api_error("任务领取记录不存在", 404)
+        if assignment["status"] not in ("claimed", "rejected"):
+            return api_error("当前任务状态不能提交", 409)
+        conn.execute(
+            "UPDATE task_assignments SET status = 'submitted', submitted_at = ?, review_note = NULL WHERE id = ?",
+            (datetime.now().astimezone().isoformat(timespec="seconds"), assignment_id),
+        )
+        return jsonify(state_payload(conn, user))
+
+
+@app.post("/api/task-assignments/<int:assignment_id>/approve")
+@require_admin
+def approve_task(assignment_id: int):
+    with connection() as conn:
+        user = current_user(conn)
+        assignment = conn.execute(
+            """
+            SELECT ta.*, t.title, t.reward_coins, t.reward_exp, t.task_type,
+                   a.display_name AS account_name
+            FROM task_assignments ta
+            JOIN tasks t ON t.id = ta.task_id
+            JOIN accounts a ON a.id = ta.account_id
+            WHERE ta.id = ?
+            """,
+            (assignment_id,),
+        ).fetchone()
+        if assignment is None or assignment["status"] != "submitted":
+            return api_error("待审核的任务提交不存在", 404)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        reward_coins = adjusted_earn_coins(conn, int(assignment["account_id"]), int(assignment["reward_coins"]))
+        conn.execute(
+            "INSERT INTO records(account_id, title, amount, type, date, time, created_at) VALUES (?, ?, ?, 'income', ?, ?, ?)",
+            (
+                assignment["account_id"],
+                f"任务完成：{assignment['title']}",
+                reward_coins,
+                current_date(),
+                current_time(),
+                now,
+            ),
+        )
+        conn.execute(
+            "UPDATE task_assignments SET status = 'completed', completed_at = ?, reviewer_id = ?, review_note = NULL WHERE id = ?",
+            (now, user["id"], assignment_id),
+        )
+        unlock_achievements(conn, int(assignment["account_id"]))
+        return jsonify(state_payload(conn, user))
+
+
+@app.post("/api/task-assignments/<int:assignment_id>/reject")
+@require_admin
+def reject_task(assignment_id: int):
+    payload = request.get_json(silent=True) or {}
+    reason = str(payload.get("reason", "请完成任务后重新提交")).strip()[:200] or "请完成任务后重新提交"
+    with connection() as conn:
+        user = current_user(conn)
+        assignment = conn.execute(
+            "SELECT id FROM task_assignments WHERE id = ? AND status = 'submitted'",
+            (assignment_id,),
+        ).fetchone()
+        if assignment is None:
+            return api_error("待审核的任务提交不存在", 404)
+        conn.execute(
+            "UPDATE task_assignments SET status = 'rejected', reviewer_id = ?, review_note = ? WHERE id = ?",
+            (user["id"], reason, assignment_id),
+        )
+        return jsonify(state_payload(conn, user))
+
+
+@app.get("/api/announcements")
+@require_user
+def list_announcements():
+    with connection() as conn:
+        user = current_user(conn)
+        return jsonify({"announcements": announcement_rows(conn, user)})
+
+
+@app.post("/api/announcements")
+@require_admin
+def create_announcement():
+    payload = request.get_json(silent=True) or {}
+    title = str(payload.get("title", "")).strip()[:80]
+    content = str(payload.get("content", "")).strip()[:500]
+    audience = str(payload.get("audience", "all")).lower()
+    if not title or not content:
+        return api_error("公告标题和内容不能为空")
+    if audience not in {"all", "children"}:
+        return api_error("公告范围无效")
     with connection() as conn:
         user = current_user(conn)
         now = datetime.now().astimezone().isoformat(timespec="seconds")
-        updated = conn.execute(
-            "UPDATE app_settings SET value = ?, updated_at = ? WHERE key = 'points_per_yuan'",
-            (str(rate), now),
+        cursor = conn.execute(
+            """
+            INSERT INTO announcements(title, content, audience, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (title, content, audience, user["id"], now, now),
         )
-        if updated.rowcount == 0:
-            conn.execute(
-                "INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?)",
-                ("points_per_yuan", str(rate), now),
-            )
+        return jsonify({"announcement_id": cursor.lastrowid, **state_payload(conn, user)}), 201
+
+
+@app.route("/api/announcements/<int:announcement_id>", methods=["PUT", "DELETE"])
+@require_admin
+def announcement_detail(announcement_id: int):
+    with connection() as conn:
+        user = current_user(conn)
+        existing = conn.execute(
+            "SELECT * FROM announcements WHERE id = ? AND is_active = 1",
+            (announcement_id,),
+        ).fetchone()
+        if existing is None:
+            return api_error("公告不存在", 404)
+        if request.method == "DELETE":
+            conn.execute("UPDATE announcements SET is_active = 0 WHERE id = ?", (announcement_id,))
+            return jsonify({"deleted": True, **state_payload(conn, user)})
+        payload = request.get_json(silent=True) or {}
+        title = str(payload.get("title", "")).strip()[:80]
+        content = str(payload.get("content", "")).strip()[:500]
+        audience = str(payload.get("audience", existing["audience"])).lower()
+        if not title or not content:
+            return api_error("公告标题和内容不能为空")
+        if audience not in {"all", "children"}:
+            return api_error("公告范围无效")
+        conn.execute(
+            "UPDATE announcements SET title = ?, content = ?, audience = ?, updated_at = ? WHERE id = ?",
+            (title, content, audience, datetime.now().astimezone().isoformat(timespec="seconds"), announcement_id),
+        )
         return jsonify(state_payload(conn, user))
 
 
@@ -1119,7 +1827,7 @@ def create_transaction():
                         return api_error("赚取项目不存在", 404)
                     name, points_value = item["name"], item["points"]
                 points = positive_int(points_value)
-                amount = points
+                amount = adjusted_earn_coins(conn, account_id, points) if user["role"] == "child" else points
             elif kind == "deduct":
                 item_id = int(payload.get("item_id")) if payload.get("item_id") is not None else None
                 if item_id:
@@ -1138,15 +1846,17 @@ def create_transaction():
                         return api_error("兑换奖励不存在", 404)
                     name, points_value = reward["name"], reward["points"]
                 points = positive_int(points_value)
-                if get_balance(conn, account_id) < points:
+                charged_points = adjusted_exchange_coins(conn, account_id, points) if user["role"] == "child" else points
+                if get_balance(conn, account_id) < charged_points:
                     return api_error("积分不足", 409)
-                amount = -points
+                amount = -charged_points
                 transaction_type = "expense"
             elif kind == "cash_exchange":
                 points = positive_int(points_value, "兑换积分")
-                if get_balance(conn, account_id) < points:
+                charged_points = adjusted_exchange_coins(conn, account_id, points) if user["role"] == "child" else points
+                if get_balance(conn, account_id) < charged_points:
                     return api_error("积分不足", 409)
-                amount = -points
+                amount = -charged_points
                 name = f"兑换现金 ¥{points / points_per_yuan(conn):.2f}"
                 transaction_type = "expense"
             elif kind == "manual":
@@ -1328,6 +2038,9 @@ def clear_points():
         account_id = active_child_id(conn, user)
         conn.execute("DELETE FROM records WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM point_requests WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM task_assignments WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM account_achievements WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM app_settings WHERE key = ?", (adventure_level_key(account_id),))
         return jsonify(state_payload(conn, user))
 
 
@@ -1341,6 +2054,9 @@ def reset_system():
             return api_error("当前没有可用的孩子账号")
         conn.execute("DELETE FROM records WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM point_requests WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM task_assignments WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM account_achievements WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM app_settings WHERE key = ?", (adventure_level_key(account_id),))
         for table in ("earn_items", "deduct_items", "rewards"):
             conn.execute(f"DELETE FROM {table} WHERE account_id = ?", (account_id,))
         seed_items_for_child(conn, account_id)

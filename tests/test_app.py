@@ -48,6 +48,7 @@ class PointsManagerApiTests(unittest.TestCase):
                 self.client.delete(f"/api/accounts/{account['id']}")
         with type(self).connection() as conn:
             conn.execute("UPDATE app_settings SET value = '100' WHERE key = 'points_per_yuan'")
+            conn.execute("DELETE FROM announcements")
 
     def create_child(self, username="child1", display_name="小明", password="child123"):
         response = self.client.post(
@@ -114,7 +115,7 @@ class PointsManagerApiTests(unittest.TestCase):
 
     def test_first_run_admin_setup(self):
         with type(self).connection() as conn:
-            for table in ("account_logs", "point_requests", "records", "earn_items", "deduct_items", "rewards", "accounts"):
+            for table in ("account_logs", "point_requests", "records", "task_assignments", "account_achievements", "tasks", "earn_items", "deduct_items", "rewards", "accounts"):
                 conn.execute(f"DELETE FROM {table}")
 
         try:
@@ -312,7 +313,7 @@ class PointsManagerApiTests(unittest.TestCase):
     def test_v06_child_permissions_avatars_and_account_edit(self):
         self.create_child(username="child", display_name="小朋友")
         state = self.state()
-        self.assertEqual(state["version"], "0.6.18")
+        self.assertEqual(state["version"], "0.7.0")
         self.assertEqual(state["user"]["avatar"], "adult-male")
         self.assertEqual(state["active_child"]["avatar"], "boy")
 
@@ -389,6 +390,65 @@ class PointsManagerApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["total_points"], 250)
         self.assertIn("兑换现金 ¥1.00", [record["title"] for record in response.get_json()["records"]])
+
+    def test_adventure_level_can_be_managed_or_return_to_auto(self):
+        self.create_child(username="level-child", display_name="等级孩子")
+        response = self.client.put("/api/settings", json={"adventure_level": 7})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["settings"]["manual_adventure_level"], 7)
+        self.assertEqual(data["settings"]["adventure_level_mode"], "manual")
+        self.assertEqual(data["gamification"]["level"], 7)
+        self.assertEqual(data["gamification"]["level_mode"], "manual")
+
+        response = self.client.put("/api/settings", json={"adventure_level": "auto"})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertIsNone(data["settings"]["manual_adventure_level"])
+        self.assertEqual(data["settings"]["adventure_level_mode"], "auto")
+        self.assertEqual(data["gamification"]["level"], 1)
+
+    def test_level_benefits_raise_earnings_and_lower_exchange_cost(self):
+        self.create_child(username="benefit-child", display_name="福利孩子")
+        response = self.client.put("/api/settings", json={"adventure_level": 3})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["gamification"]["earn_bonus_percent"], 10)
+        self.assertEqual(response.get_json()["gamification"]["exchange_discount_percent"], 5)
+
+        earn = self.client.post("/api/items/earn", json={"name": "等级加金币", "points": 10, "icon": "points.svg"})
+        self.assertEqual(earn.status_code, 201)
+        reward = self.client.post("/api/items/reward", json={"name": "等级兑换", "points": 50, "icon": "gift.svg"})
+        self.assertEqual(reward.status_code, 201)
+        self.assertEqual(
+            self.client.post("/api/transactions", json={"kind": "earn", "points": 100, "name": "准备兑换余额"}).status_code,
+            201,
+        )
+
+        self.client.post("/api/auth/logout")
+        self.assertEqual(
+            self.client.post("/api/auth/login", json={"username": "benefit-child", "password": "child123"}).status_code,
+            200,
+        )
+        data = self.state()
+        earn_item = next(item for item in data["earn_items"] if item["name"] == "等级加金币")
+        reward_item = next(item for item in data["rewards"] if item["name"] == "等级兑换")
+        self.assertEqual(earn_item["base_points"], 10)
+        self.assertEqual(earn_item["points"], 11)
+        self.assertEqual(reward_item["base_points"], 50)
+        self.assertEqual(reward_item["points"], 47)
+
+        response = self.client.post("/api/transactions", json={"kind": "earn", "item_id": earn_item["id"]})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(next(item for item in response.get_json()["requests"] if item["title"] == "等级加金币")["amount"], 11)
+        response = self.client.post("/api/transactions", json={"kind": "cash_exchange", "points": 50})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(next(item for item in response.get_json()["requests"] if item["kind"] == "cash_exchange")["amount"], -47)
+
+        self.client.post("/api/auth/logout")
+        self.assertEqual(self.client.post("/api/auth/login", json={"username": "admin", "password": "admin123"}).status_code, 200)
+        response = self.client.post("/api/transactions", json={"kind": "earn", "points": 10, "name": "管理员发放"})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["records"][0]["amount"], 10)
 
     def test_child_can_change_own_password(self):
         child = self.create_child(username="password-child", display_name="改密孩子")
@@ -525,6 +585,89 @@ class PointsManagerApiTests(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 201)
             self.assertEqual(response.get_json()["icon"], "laundry.svg")
+
+    def test_rpg_task_lifecycle_rewards_coins_experience_and_achievement(self):
+        child = self.create_child(username="questkid", display_name="任务玩家", password="quest123")
+        response = self.client.post(
+            "/api/tasks",
+            json={
+                "title": "清理 NAS 垃圾空间",
+                "description": "清理完成后提交验收",
+                "category": "NAS",
+                "task_type": "epic",
+                "difficulty": "hard",
+                "reward_coins": 40,
+                "reward_exp": 25,
+                "icon": "computer.svg",
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+        task_id = response.get_json()["task"]["id"]
+
+        self.client.post("/api/auth/logout")
+        self.assertEqual(self.client.post("/api/auth/login", json={"username": "questkid", "password": "quest123"}).status_code, 200)
+        response = self.client.post(f"/api/tasks/{task_id}/claim")
+        self.assertEqual(response.status_code, 201)
+        assignment_id = response.get_json()["assignment_id"]
+        self.assertEqual(self.client.post(f"/api/task-assignments/{assignment_id}/submit").status_code, 200)
+
+        self.client.post("/api/auth/logout")
+        self.assertEqual(self.client.post("/api/auth/login", json={"username": "admin", "password": "admin123"}).status_code, 200)
+        response = self.client.post(f"/api/task-assignments/{assignment_id}/approve")
+        self.assertEqual(response.status_code, 200)
+
+        self.client.post("/api/auth/logout")
+        response = self.client.post("/api/auth/login", json={"username": "questkid", "password": "quest123"})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["gamification"]["coins"], 40)
+        self.assertEqual(data["gamification"]["experience"], 25)
+        self.assertTrue(any(item["achievement_key"] == "first-quest" and item["unlocked"] for item in data["achievements"]))
+
+    def test_builtin_delivery_icon_is_allowed_and_unknown_icon_is_rejected(self):
+        self.create_child(username="icon-child", display_name="Icon Child", password="child123")
+        response = self.client.post(
+            "/api/items/earn",
+            json={"name": "快递取件", "points": 8, "icon": "emoji:delivery"},
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["icon"], "emoji:delivery")
+        self.assertEqual(
+            self.client.post(
+                "/api/items/earn",
+                json={"name": "未知图标", "points": 8, "icon": "emoji:not-a-real-icon"},
+            ).status_code,
+            400,
+        )
+
+    def test_announcements_can_be_published_edited_removed_and_seen_by_children(self):
+        child = self.create_child(username="notice-child", display_name="Notice Child", password="child123")
+        response = self.client.post(
+            "/api/announcements",
+            json={"title": "本周悬赏", "content": "完成家庭挑战领取金币", "audience": "children"},
+        )
+        self.assertEqual(response.status_code, 201)
+        announcement_id = response.get_json()["announcement_id"]
+        self.assertEqual(response.get_json()["announcements"][0]["title"], "本周悬赏")
+
+        response = self.client.put(
+            f"/api/announcements/{announcement_id}",
+            json={"title": "更新后的悬赏", "content": "今晚前提交任务", "audience": "all"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["announcements"][0]["audience"], "all")
+
+        self.client.post("/api/auth/logout")
+        self.assertEqual(
+            self.client.post("/api/auth/login", json={"username": child["username"], "password": "child123"}).status_code,
+            200,
+        )
+        self.assertEqual(self.state()["announcements"][0]["title"], "更新后的悬赏")
+
+        self.client.post("/api/auth/logout")
+        self.client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        self.assertEqual(self.client.delete(f"/api/announcements/{announcement_id}").status_code, 200)
+        self.assertEqual(self.state()["announcements"], [])
 
     def test_clear_and_reset(self):
         self.create_child()
