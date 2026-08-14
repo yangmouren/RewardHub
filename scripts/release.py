@@ -64,7 +64,6 @@ def bump_version(version: str) -> None:
         rf'\g<1>{version}',
         1,
     )
-    replace_file("templates/index.html", r"\d+\.\d+\.\d+", version)
     replace_file("README.md", r"\d+\.\d+\.\d+", version, 1)
     replace_file("tests/test_app.py", r"\d+\.\d+\.\d+", version)
     replace_file(
