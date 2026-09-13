@@ -9,3 +9,5 @@ points_data/
 build/
 dist/
 *.spec
+.workbuddy/
+.env

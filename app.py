@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import base64
 import binascii
+import calendar
 import hashlib
+import json
 import math
 import os
 import re
 import secrets
+import time
+from threading import Lock
 import sqlite3
 import sys
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from typing import Any, Iterator
@@ -28,7 +32,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", str(DEFAULT_DATA_DIR)))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(DATA_DIR / "points.db")))
 SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-key-in-production")
 PASSWORD_ITERATIONS = 240_000
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.13.6"
 AVATAR_OPTIONS = {"boy", "girl", "adult-male", "adult-female"}
 CHILD_AVATARS = {"boy", "girl"}
 PROJECT_ICONS = {
@@ -58,8 +62,20 @@ BUILTIN_ICON_KEYS = set(
 )
 ITEM_DEFAULT_ICONS = {"earn": "points.svg", "deduct": "warning.svg", "reward": "gift.svg"}
 DEFAULT_SETTINGS = {"points_per_yuan": 100}
-TASK_TYPES = {"daily", "epic"}
+# 每日提交审核额度（v0.11.0）：按「当天提交总次数」计数，避免孩子端刷量把审核队列挤爆。
+# 0 表示不限制；每个孩子账号独立配置，缺省 10 次。
+DEFAULT_DAILY_SUBMIT_LIMIT = 10
+MAX_DAILY_SUBMIT_LIMIT = 999
+TASK_TYPES = {"daily", "epic", "repeat"}
 TASK_DIFFICULTIES = {"easy", "normal", "hard", "legendary"}
+# 重复任务（v0.9.0）：统一为「频率 + 星期几 + 第几个 + 有效期」四要素，不为个别场景开特例。
+# - daily   ：每天都触发
+# - weekly  ：每周的 repeat_days 指定星期几触发
+# - monthly ：每月第 repeat_month_week 个 repeat_days 指定星期几触发（5 表示最后一个）
+REPEAT_FREQUENCIES = {"daily", "weekly", "monthly"}
+WEEKDAY_TEXT = {1: "周一", 2: "周二", 3: "周三", 4: "周四", 5: "周五", 6: "周六", 7: "周日"}
+WEEKDAY_ORDER = (1, 2, 3, 4, 5, 6, 7)
+LAST_WEEK_INDEX = 5
 DEFAULT_ACHIEVEMENTS = [
     ("first-quest", "初次出征", "完成第一个现实任务", "points.svg", "completed_tasks", 1),
     ("habit-builder", "习惯养成", "完成 3 个任务，建立自己的节奏", "bedtime.svg", "completed_tasks", 3),
@@ -109,16 +125,6 @@ CUSTOM_ASSET_KEYS = {
 }
 CUSTOM_IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 
-app = Flask(
-    __name__,
-    template_folder=str(RESOURCE_DIR / "templates"),
-    static_folder=str(RESOURCE_DIR / "static"),
-)
-app.config.update(
-    SECRET_KEY=SECRET_KEY,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-)
 
 
 @contextmanager
@@ -336,6 +342,226 @@ def seed_items_for_child(conn: sqlite3.Connection, account_id: int) -> None:
             )
 
 
+def migrate_tasks_repeat(conn: sqlite3.Connection) -> None:
+    """v0.9.0：让 tasks 支持「重复任务」。
+
+    老库的 task_type 上带着 CHECK(task_type IN ('daily','epic'))，SQLite 不能直接改约束，
+    所以需要重建表。新库由 CREATE TABLE 自带重复字段，这里只在缺列时才会真正执行。
+    """
+    if table_has_column(conn, "tasks", "repeat_freq"):
+        return
+    # task_assignments 未声明外键（仅 task_id 列），重命名不会破坏引用
+    conn.execute("ALTER TABLE tasks RENAME TO tasks_legacy")
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT '生活',
+            task_type TEXT NOT NULL CHECK (task_type IN ('daily', 'epic', 'repeat')),
+            difficulty TEXT NOT NULL DEFAULT 'normal' CHECK (difficulty IN ('easy', 'normal', 'hard', 'legendary')),
+            reward_coins INTEGER NOT NULL CHECK (reward_coins > 0),
+            reward_exp INTEGER NOT NULL CHECK (reward_exp > 0),
+            icon TEXT NOT NULL DEFAULT 'points.svg',
+            due_date TEXT,
+            created_by INTEGER NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            repeat_freq TEXT,
+            repeat_days TEXT,
+            repeat_month_week INTEGER,
+            repeat_start TEXT,
+            repeat_end TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO tasks(
+            id, title, description, category, task_type, difficulty, reward_coins, reward_exp,
+            icon, due_date, created_by, is_active, created_at,
+            repeat_freq, repeat_days, repeat_month_week, repeat_start, repeat_end
+        )
+        SELECT
+            id, title, description, category, task_type, difficulty, reward_coins, reward_exp,
+            icon, due_date, created_by, is_active, created_at,
+            NULL, NULL, NULL, NULL, NULL
+        FROM tasks_legacy
+        """
+    )
+    conn.execute("DROP TABLE tasks_legacy")
+
+
+# ---------------------------------------------------------------------------
+# 重复任务（v0.9.0）
+# ---------------------------------------------------------------------------
+
+
+def parse_weekday_list(raw: Any) -> list[int]:
+    """把 '1,2,3' / [1,2,3] 解析成有序去重的星期列表（1=周一 ... 7=周日）。"""
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        parts = list(raw)
+    else:
+        parts = [piece for piece in re.split(r"[,\s]+", str(raw)) if piece]
+    days: list[int] = []
+    for piece in parts:
+        try:
+            value = int(piece)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("星期选择无效") from exc
+        if value not in WEEKDAY_TEXT:
+            raise ValueError("星期选择无效")
+        if value not in days:
+            days.append(value)
+    return [day for day in WEEKDAY_ORDER if day in days]
+
+
+def normalize_repeat_rule(payload: dict[str, Any], task_type: str) -> dict[str, Any]:
+    """校验并归一化重复规则。task_type 不是 repeat 时返回全空值。"""
+    empty = {
+        "repeat_freq": None,
+        "repeat_days": None,
+        "repeat_month_week": None,
+        "repeat_start": None,
+        "repeat_end": None,
+    }
+    if task_type != "repeat":
+        return empty
+    freq = str(payload.get("repeat_freq") or "daily").strip().lower()
+    if freq not in REPEAT_FREQUENCIES:
+        raise ValueError("重复频率无效")
+    days = parse_weekday_list(payload.get("repeat_days"))
+    month_week: int | None = None
+    if freq in ("weekly", "monthly") and not days:
+        raise ValueError("每周/每月重复至少要选择一个星期")
+    if freq == "monthly":
+        try:
+            month_week = int(payload.get("repeat_month_week") or 1)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("「第几个」必须是数字") from exc
+        if not 1 <= month_week <= LAST_WEEK_INDEX:
+            raise ValueError(f"「第几个」需要在 1 到 {LAST_WEEK_INDEX} 之间（{LAST_WEEK_INDEX} 表示最后一个）")
+    start_raw = str(payload.get("repeat_start") or "").strip()
+    end_raw = str(payload.get("repeat_end") or "").strip()
+    try:
+        start = date.fromisoformat(start_raw).isoformat() if start_raw else None
+        end = date.fromisoformat(end_raw).isoformat() if end_raw else None
+    except ValueError as exc:
+        raise ValueError("重复生效日期格式必须为 YYYY-MM-DD") from exc
+    if start and end and end < start:
+        raise ValueError("重复结束日期不能早于开始日期")
+    return {
+        "repeat_freq": freq,
+        "repeat_days": ",".join(str(day) for day in days) if days else None,
+        "repeat_month_week": month_week,
+        "repeat_start": start,
+        "repeat_end": end,
+    }
+
+
+def nth_weekday_of_month(day: date, weekday: int) -> int:
+    """day 是当月的第几个「weekday」（1 起）。"""
+    return (day.day - 1) // 7 + 1
+
+
+def is_last_weekday_of_month(day: date) -> bool:
+    return day.day + 7 > calendar.monthrange(day.year, day.month)[1]
+
+
+def repeat_matches(task: sqlite3.Row | dict[str, Any], day: date) -> bool:
+    """判断某个重复任务在 `day` 这天是否触发。"""
+    freq = (task["repeat_freq"] or "").strip().lower()
+    if freq not in REPEAT_FREQUENCIES:
+        return False
+    if task["repeat_start"] and day.isoformat() < task["repeat_start"]:
+        return False
+    if task["repeat_end"] and day.isoformat() > task["repeat_end"]:
+        return False
+    if freq == "daily":
+        return True
+    days = parse_weekday_list(task["repeat_days"])
+    if day.isoweekday() not in days:
+        return False
+    if freq == "weekly":
+        return True
+    # monthly：第 repeat_month_week 个该星期几（LAST_WEEK_INDEX 表示最后一个）
+    nth = int(task["repeat_month_week"] or 1)
+    if nth >= LAST_WEEK_INDEX:
+        return is_last_weekday_of_month(day)
+    return nth_weekday_of_month(day, day.isoweekday()) == nth
+
+
+def repeat_rule_text(task: sqlite3.Row | dict[str, Any]) -> str:
+    """把重复规则渲染成一句人话，例如「每周一、三、五」「每月第 1 个周六、周日」。"""
+    freq = (task["repeat_freq"] or "").strip().lower()
+    if freq not in REPEAT_FREQUENCIES:
+        return ""
+    if freq == "daily":
+        text = "每天"
+    else:
+        days = parse_weekday_list(task["repeat_days"])
+        names = "、".join(WEEKDAY_TEXT[day].replace("周", "") for day in days)
+        if freq == "weekly":
+            text = f"每周{names}"
+        else:
+            nth = int(task["repeat_month_week"] or 1)
+            label = "最后一个" if nth >= LAST_WEEK_INDEX else f"第 {nth} 个"
+            text = f"每月{label}周{names}"
+    window = []
+    if task["repeat_start"]:
+        window.append(f"{task['repeat_start'][5:]} 起")
+    if task["repeat_end"]:
+        window.append(f"{task['repeat_end'][5:]} 止")
+    if window:
+        text += f"（{'，'.join(window)}）"
+    return text
+
+
+def next_repeat_occurrence(task: sqlite3.Row | dict[str, Any], day: date, horizon_days: int = 400) -> date | None:
+    """从 `day` 起（含当天）找下一次触发的日期；计划已结束或规则无效时返回 None。
+
+    用于孩子端把「今天不触发但还没结束」的重复任务以「未开始 · 下次 X」的形式提前展示出来。
+    """
+    if (task["repeat_end"] or "") and task["repeat_end"] < day.isoformat():
+        return None
+    for offset in range(horizon_days + 1):
+        candidate = day + timedelta(days=offset)
+        if repeat_matches(task, candidate):
+            return candidate
+    return None
+
+
+def ensure_repeat_assignments(conn: sqlite3.Connection, account_id: int | None, day: date | None = None) -> int:
+    """把「今天该做的重复任务」物化成已领取(claimed)状态，孩子打开就自动可见。
+
+    只处理当天、不回补历史：漏做的重复任务过期即消失，符合习惯养成语义。
+    UNIQUE(task_id, account_id, claim_date) 保证重复调用幂等。
+    """
+    if account_id is None:
+        return 0
+    target_day = day or datetime.now().astimezone().date()
+    rows = conn.execute("SELECT * FROM tasks WHERE is_active = 1 AND task_type = 'repeat'").fetchall()
+    if not rows:
+        return 0
+    created = 0
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    for task in rows:
+        if not repeat_matches(task, target_day):
+            continue
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO task_assignments(task_id, account_id, status, claim_date, claimed_at)
+            VALUES (?, ?, 'claimed', ?, ?)
+            """,
+            (int(task["id"]), int(account_id), target_day.isoformat(), now),
+        )
+        created += max(cursor.rowcount, 0)
+    return created
+
+
 def remove_legacy_default_child(conn: sqlite3.Connection) -> None:
     """Remove the untouched child created by versions before 0.6.2."""
     child = conn.execute(
@@ -373,6 +599,7 @@ def init_db() -> None:
                 role TEXT NOT NULL CHECK (role IN ('admin', 'child')),
                 avatar TEXT NOT NULL DEFAULT 'boy',
                 active INTEGER NOT NULL DEFAULT 1,
+                daily_submit_limit INTEGER NOT NULL DEFAULT 10,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS earn_items (
@@ -442,7 +669,7 @@ def init_db() -> None:
                 title TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
                 category TEXT NOT NULL DEFAULT '生活',
-                task_type TEXT NOT NULL CHECK (task_type IN ('daily', 'epic')),
+                task_type TEXT NOT NULL CHECK (task_type IN ('daily', 'epic', 'repeat')),
                 difficulty TEXT NOT NULL DEFAULT 'normal' CHECK (difficulty IN ('easy', 'normal', 'hard', 'legendary')),
                 reward_coins INTEGER NOT NULL CHECK (reward_coins > 0),
                 reward_exp INTEGER NOT NULL CHECK (reward_exp > 0),
@@ -450,7 +677,12 @@ def init_db() -> None:
                 due_date TEXT,
                 created_by INTEGER NOT NULL,
                 is_active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                repeat_freq TEXT,
+                repeat_days TEXT,
+                repeat_month_week INTEGER,
+                repeat_start TEXT,
+                repeat_end TEXT
             );
             CREATE TABLE IF NOT EXISTS task_assignments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -465,6 +697,18 @@ def init_db() -> None:
                 review_note TEXT,
                 UNIQUE(task_id, account_id, claim_date)
             );
+            -- 每次「提交审核」都记一条（v0.11.0）。被退回后重新提交也算一次，
+            -- 所以不能靠 task_assignments.submitted_at 计数（那会被覆盖）。
+            CREATE TABLE IF NOT EXISTS task_submit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                task_id INTEGER NOT NULL,
+                assignment_id INTEGER NOT NULL,
+                submit_date TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_submit_log_account_date
+                ON task_submit_log(account_id, submit_date);
             CREATE TABLE IF NOT EXISTS achievements (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 achievement_key TEXT NOT NULL UNIQUE,
@@ -494,8 +738,14 @@ def init_db() -> None:
             """
         )
         migrate_point_requests(conn)
+        migrate_tasks_repeat(conn)
         if not table_has_column(conn, "accounts", "avatar"):
             conn.execute("ALTER TABLE accounts ADD COLUMN avatar TEXT NOT NULL DEFAULT 'boy'")
+        if not table_has_column(conn, "accounts", "daily_submit_limit"):
+            # v0.11.0：老库补列，存量孩子账号一律落到默认额度
+            conn.execute(
+                f"ALTER TABLE accounts ADD COLUMN daily_submit_limit INTEGER NOT NULL DEFAULT {DEFAULT_DAILY_SUBMIT_LIMIT}"
+            )
         for column, default in (("actor_avatar", "adult-male"), ("target_avatar", "boy")):
             if not table_has_column(conn, "account_logs", column):
                 conn.execute(f"ALTER TABLE account_logs ADD COLUMN {column} TEXT NOT NULL DEFAULT '{default}'")
@@ -782,12 +1032,15 @@ def account_overview_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             COALESCE((SELECT SUM(r.amount) FROM records r WHERE r.account_id = a.id), 0) AS total_points,
             COALESCE((SELECT SUM(r.amount) FROM records r WHERE r.account_id = a.id AND r.date = ?), 0) AS today_net,
             (SELECT COUNT(*) FROM point_requests pr WHERE pr.account_id = a.id AND pr.status = 'pending') AS pending_count,
+            (SELECT COUNT(*) FROM task_assignments ta WHERE ta.account_id = a.id AND ta.status = 'submitted') AS task_pending_count,
+            COALESCE(a.daily_submit_limit, ?) AS daily_submit_limit,
+            (SELECT COUNT(*) FROM task_submit_log tsl WHERE tsl.account_id = a.id AND tsl.submit_date = ?) AS today_submit_count,
             (SELECT MAX(r.created_at) FROM records r WHERE r.account_id = a.id) AS last_activity
         FROM accounts a
         WHERE a.active = 1
         ORDER BY CASE a.role WHEN 'child' THEN 0 ELSE 1 END, a.id
         """,
-        (today,),
+        (today, DEFAULT_DAILY_SUBMIT_LIMIT, today),
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -893,18 +1146,92 @@ def task_assignment_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def daily_submit_limit_for(conn: sqlite3.Connection, account_id: int | None) -> int:
+    """孩子的每日提交审核额度；0 表示不限制。缺列/缺行/脏数据一律回落到默认值。"""
+    if account_id is None:
+        return DEFAULT_DAILY_SUBMIT_LIMIT
+    row = conn.execute("SELECT daily_submit_limit FROM accounts WHERE id = ?", (account_id,)).fetchone()
+    if row is None or row["daily_submit_limit"] is None:
+        return DEFAULT_DAILY_SUBMIT_LIMIT
+    try:
+        limit = int(row["daily_submit_limit"])
+    except (TypeError, ValueError):
+        return DEFAULT_DAILY_SUBMIT_LIMIT
+    if limit < 0:
+        return DEFAULT_DAILY_SUBMIT_LIMIT
+    return min(limit, MAX_DAILY_SUBMIT_LIMIT)
+
+
+def submit_count_today(conn: sqlite3.Connection, account_id: int | None, day: str | None = None) -> int:
+    """当天已经点了几次「提交审核」。被退回后重新提交也计数，所以查的是事件日志。"""
+    if account_id is None:
+        return 0
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) FROM task_submit_log WHERE account_id = ? AND submit_date = ?",
+            (account_id, day or current_date()),
+        ).fetchone()[0]
+    )
+
+
+def submit_quota_payload(conn: sqlite3.Connection, account_id: int | None) -> dict[str, Any]:
+    """给前端展示用的额度快照；limit=0 时 remaining 为 None（表示不限制）。"""
+    limit = daily_submit_limit_for(conn, account_id)
+    used = submit_count_today(conn, account_id)
+    return {
+        "limit": limit,
+        "used": used,
+        "unlimited": limit == 0,
+        "remaining": None if limit == 0 else max(limit - used, 0),
+    }
+
+
+def normalize_submit_limit(raw: Any) -> int:
+    """校验账号级「每日提交上限」：0 = 不限制，1..999 为具体次数。"""
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_DAILY_SUBMIT_LIMIT
+    try:
+        limit = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("每日提交上限必须是 0 到 999 的整数") from exc
+    if limit < 0 or limit > MAX_DAILY_SUBMIT_LIMIT:
+        raise ValueError(f"每日提交上限必须在 0 到 {MAX_DAILY_SUBMIT_LIMIT} 之间（0 表示不限制）")
+    return limit
+
+
+def task_is_edit_locked(task_type: str, approved_count: int) -> bool:
+    """任务是否已「锁定不可编辑」：非重复任务一旦有审核通过的提交，规则就已生效。
+
+    - 已完成并验收通过的日常/史诗任务：再改标题或奖励等于篡改已结算的结果，管理端只能查看。
+    - 重复任务是长期模板，孩子每周都会重新做一次，因此永远允许修改规则。
+    """
+    return task_type != "repeat" and approved_count > 0
+
+
 def task_rows(conn: sqlite3.Connection, user: sqlite3.Row) -> list[dict[str, Any]]:
+    is_child = user["role"] == "child"
+    target_account = int(user["id"]) if is_child else active_child_id(conn, user)
+    # 重复任务：先把「今天该做的」落成已领取状态，孩子打开就能直接看到，无需每天手动创建
+    ensure_repeat_assignments(conn, target_account)
+    today = datetime.now().astimezone().date()
     tasks = conn.execute(
         """
         SELECT t.*, a.display_name AS creator_name
         FROM tasks t
         LEFT JOIN accounts a ON a.id = t.created_by
         WHERE t.is_active = 1
-        ORDER BY CASE t.task_type WHEN 'epic' THEN 0 ELSE 1 END, t.id DESC
+        ORDER BY CASE t.task_type WHEN 'epic' THEN 0 WHEN 'repeat' THEN 1 ELSE 2 END, t.id DESC
         """
     ).fetchall()
     result: list[dict[str, Any]] = []
     for task in tasks:
+        is_repeat = task["task_type"] == "repeat"
+        active_today = repeat_matches(task, today) if is_repeat else True
+        # 重复任务：算出下一次触发日期；只有「计划已结束/规则无效」才对孩子彻底隐藏。
+        # 今天不触发但还没结束的，孩子端以「未开始 · 下次 X」提前展示（漏做仍不补做）。
+        next_day = next_repeat_occurrence(task, today) if is_repeat else None
+        if is_child and is_repeat and next_day is None:
+            continue
         assignments = conn.execute(
             """
             SELECT ta.*, a.display_name AS account_name, a.avatar AS account_avatar
@@ -916,9 +1243,10 @@ def task_rows(conn: sqlite3.Connection, user: sqlite3.Row) -> list[dict[str, Any
             (task["id"],),
         ).fetchall()
         own = next(
-            (row for row in assignments if int(row["account_id"]) == int(user["id"])),
+            (row for row in assignments if target_account is not None and int(row["account_id"]) == int(target_account)),
             None,
         )
+        approved_count = sum(1 for row in assignments if row["status"] == "completed")
         result.append(
             {
                 "id": task["id"],
@@ -927,18 +1255,71 @@ def task_rows(conn: sqlite3.Connection, user: sqlite3.Row) -> list[dict[str, Any
                 "category": task["category"],
                 "task_type": task["task_type"],
                 "difficulty": task["difficulty"],
-                "reward_coins": adjusted_earn_coins(conn, int(user["id"]), int(task["reward_coins"])) if user["role"] == "child" else task["reward_coins"],
+                "reward_coins": adjusted_earn_coins(conn, int(user["id"]), int(task["reward_coins"])) if is_child else task["reward_coins"],
                 "base_reward_coins": task["reward_coins"],
                 "reward_exp": task["reward_exp"],
                 "icon": task["icon"],
                 "due_date": task["due_date"],
                 "creator_name": task["creator_name"] or "管理员",
                 "participant_count": len(assignments),
-                "assignments": [task_assignment_row(row) for row in assignments] if user["role"] == "admin" else [],
+                "approved_count": approved_count,
+                # v0.13.2：验收通过后管理端不能再编辑（后端 PUT 同样会拒绝）
+                "edit_locked": task_is_edit_locked(task["task_type"], approved_count),
+                "assignments": [task_assignment_row(row) for row in assignments] if not is_child else [],
                 "my_assignment": task_assignment_row(own) if own is not None else None,
+                "repeat_freq": task["repeat_freq"],
+                "repeat_days": parse_weekday_list(task["repeat_days"]) if is_repeat else [],
+                "repeat_month_week": task["repeat_month_week"],
+                "repeat_start": task["repeat_start"],
+                "repeat_end": task["repeat_end"],
+                "repeat_text": repeat_rule_text(task),
+                "active_today": active_today,
+                "next_date": next_day.isoformat() if next_day else None,
             }
         )
+    if is_child:
+        # 今天能做的排在前面，未来才开始的排在后面（sort 稳定，同组保持原有类型顺序）
+        result.sort(key=lambda item: 0 if item["active_today"] else 1)
     return result
+
+
+def task_review_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """管理端「审核中心」的任务验收队列：所有孩子已提交、等待验收的任务。
+
+    刻意**不过滤** `tasks.is_active`：任务被撤下（软删除）后，孩子已经提交的那一份
+    仍需要管理端给出结论，否则会永远卡在「待验收」而既拿不到积分也无法重做。
+    """
+    rows = conn.execute(
+        """
+        SELECT ta.id AS assignment_id, ta.task_id, ta.account_id, ta.claim_date, ta.submitted_at,
+               t.title AS task_title, t.icon AS task_icon, t.is_active AS task_active,
+               t.reward_coins AS base_reward_coins, t.reward_exp AS reward_exp,
+               a.display_name AS child_name, a.avatar AS child_avatar
+        FROM task_assignments ta
+        JOIN tasks t ON t.id = ta.task_id
+        JOIN accounts a ON a.id = ta.account_id
+        WHERE ta.status = 'submitted'
+        ORDER BY ta.id DESC
+        """
+    ).fetchall()
+    return [
+        {
+            "assignment_id": row["assignment_id"],
+            "task_id": row["task_id"],
+            "account_id": row["account_id"],
+            "child_name": row["child_name"],
+            "child_avatar": row["child_avatar"],
+            "task_title": row["task_title"],
+            "task_icon": row["task_icon"],
+            "task_active": bool(row["task_active"]),
+            "claim_date": row["claim_date"],
+            "submitted_at": row["submitted_at"],
+            "reward_coins": adjusted_earn_coins(conn, int(row["account_id"]), int(row["base_reward_coins"])),
+            "base_reward_coins": int(row["base_reward_coins"]),
+            "reward_exp": int(row["reward_exp"] or 0),
+        }
+        for row in rows
+    ]
 
 
 def announcement_rows(conn: sqlite3.Connection, user: sqlite3.Row) -> list[dict[str, Any]]:
@@ -983,7 +1364,7 @@ def unlock_achievements(conn: sqlite3.Connection, account_id: int) -> None:
             SELECT COUNT(*)
             FROM task_assignments ta
             JOIN tasks t ON t.id = ta.task_id
-            WHERE ta.account_id = ? AND ta.status = 'completed' AND t.task_type = 'daily'
+            WHERE ta.account_id = ? AND ta.status = 'completed' AND t.task_type IN ('daily', 'repeat')
             """,
             (account_id,),
         ).fetchone()[0]
@@ -1021,7 +1402,9 @@ def state_payload(conn: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]
             "rewards": [],
             "records": [],
             "requests": request_rows(conn, user),
+            "task_reviews": task_review_rows(conn) if user["role"] == "admin" else [],
             "tasks": task_rows(conn, user),
+            "submit_quota": submit_quota_payload(conn, None),
             "announcements": announcement_rows(conn, user),
             "achievements": achievement_rows(conn, None),
             "gamification": gamification_payload(conn, None),
@@ -1055,7 +1438,9 @@ def state_payload(conn: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]
         "rewards": [child_visible_item(row, "reward", conn, user) for row in rewards],
         "records": [dict(row) for row in records],
         "requests": request_rows(conn, user),
+        "task_reviews": task_review_rows(conn) if user["role"] == "admin" else [],
         "tasks": task_rows(conn, user),
+        "submit_quota": submit_quota_payload(conn, account_id),
         "announcements": announcement_rows(conn, user),
         "achievements": achievement_rows(conn, account_id),
         "gamification": gamification_payload(conn, account_id),
@@ -1092,6 +1477,42 @@ def find_custom_asset(asset_key: str) -> Path | None:
     return None
 
 
+app = Flask(__name__, template_folder="templates", static_folder="static")
+app.config.update(
+    SECRET_KEY=SECRET_KEY,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=(os.getenv("COOKIE_SECURE", "") or "").lower() in ("1", "true", "yes"),
+)
+
+
+# --- 登录限流（防止暴力破解） ---
+LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+LOGIN_LOCK = Lock()
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_WINDOW_SECONDS = 300
+
+
+def login_rate_limited(remote_addr: str) -> bool:
+    now = time.time()
+    with LOGIN_LOCK:
+        attempts = LOGIN_ATTEMPTS.get(remote_addr, [])
+        attempts = [stamp for stamp in attempts if now - stamp < LOGIN_WINDOW_SECONDS]
+        LOGIN_ATTEMPTS[remote_addr] = attempts
+        return len(attempts) >= MAX_LOGIN_ATTEMPTS
+
+
+def record_failed_login(remote_addr: str) -> None:
+    now = time.time()
+    with LOGIN_LOCK:
+        LOGIN_ATTEMPTS.setdefault(remote_addr, []).append(now)
+
+
+def clear_failed_logins(remote_addr: str) -> None:
+    with LOGIN_LOCK:
+        LOGIN_ATTEMPTS.pop(remote_addr, None)
+
+
 @app.get("/custom-assets/<asset_key>")
 def custom_asset(asset_key: str):
     asset = find_custom_asset(asset_key)
@@ -1108,6 +1529,127 @@ def index():
 @app.get("/api/health")
 def health():
     return jsonify({"status": "ok", "version": APP_VERSION})
+
+
+# ---- 备份 / 覆盖式导入（v0.13.0）----
+# 导出与导入共用同一份表清单：漏掉 task_submit_log 会让「今日已提交次数」恢复后归零。
+EXPORT_TABLES = [
+    "accounts", "earn_items", "deduct_items", "rewards", "records",
+    "point_requests", "account_logs", "app_settings", "tasks",
+    "task_assignments", "task_submit_log", "achievements",
+    "account_achievements", "announcements",
+]
+# 覆盖式导入的清空顺序：先子表后主表（本库没声明外键，这里只是保险）。
+IMPORT_CLEAR_ORDER = [
+    "task_submit_log", "account_achievements", "task_assignments", "records",
+    "point_requests", "account_logs", "achievements", "announcements",
+    "tasks", "app_settings", "earn_items", "deduct_items", "rewards", "accounts",
+]
+MAX_IMPORT_BYTES = 25 * 1024 * 1024
+
+
+def collect_export_payload() -> dict:
+    with connection() as conn:
+        data = {
+            table: [dict(row) for row in conn.execute(f"SELECT * FROM {table}").fetchall()]
+            for table in EXPORT_TABLES
+        }
+    return {
+        "version": APP_VERSION,
+        "exported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "data": data,
+    }
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def write_backup_snapshot() -> str | None:
+    """导入前把当前整库另存一份到 data/backups，导入失败或后悔时能找回来。"""
+    try:
+        folder = DATA_DIR / "backups"
+        folder.mkdir(parents=True, exist_ok=True)
+        # 加随机后缀：同一秒内连续导入不会把上一份备份覆盖掉
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = folder / f"pre-import-{stamp}-{secrets.token_hex(2)}.json"
+        path.write_text(json.dumps(collect_export_payload(), ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(path)
+    except OSError:
+        return None
+
+
+@app.get("/api/export")
+@require_admin
+def export_family_data():
+    return jsonify(collect_export_payload())
+
+
+@app.post("/api/import")
+@require_admin
+def import_family_data():
+    """覆盖式导入：整库替换为备份文件内容（导入前自动另存一份当前数据）。"""
+    payload = request.get_json(silent=True)
+    if payload is None:
+        raw = request.get_data(cache=True)
+        if not raw:
+            return api_error("没有收到导入文件")
+        if len(raw) > MAX_IMPORT_BYTES:
+            return api_error("导入文件过大（上限 25MB）")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return api_error("导入文件不是有效的 JSON")
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict) or not data:
+        return api_error("文件格式不对：缺少 data 数据表")
+    unknown = [table for table in data if table not in EXPORT_TABLES]
+    if unknown:
+        return api_error(f"导入文件含未知数据表：{', '.join(unknown[:5])}")
+    for table, rows in data.items():
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return api_error(f"{table} 的格式不对，应该是一组记录")
+
+    with connection() as conn:
+        user = current_user(conn)
+    admin_id = user["id"] if user else None
+    backup = write_backup_snapshot()
+    try:
+        with connection() as conn:
+            for table in IMPORT_CLEAR_ORDER:
+                conn.execute(f"DELETE FROM {table}")
+            inserted = {}
+            for table in EXPORT_TABLES:
+                rows = data.get(table) or []
+                if not rows:
+                    continue
+                # 只写当前版本真实存在的列：老版本备份缺列、多列都不会整库失败
+                columns = [name for name in table_columns(conn, table) if name in rows[0]]
+                if not columns:
+                    continue
+                placeholders = ",".join(["?"] * len(columns))
+                sql = f"INSERT OR REPLACE INTO {table} ({','.join(columns)}) VALUES ({placeholders})"
+                conn.executemany(sql, [tuple(row.get(name) for name in columns) for row in rows])
+                inserted[table] = len(rows)
+    except sqlite3.Error as exc:
+        # connection() 会整段回滚，导入失败时数据库保持原样
+        return api_error(f"导入失败，数据已保持原样（{exc}）")
+
+    with connection() as conn:
+        still_admin = conn.execute(
+            "SELECT id FROM accounts WHERE id = ? AND role = 'admin'", (admin_id,)
+        ).fetchone() if admin_id else None
+        if admin_id and not still_admin:
+            # 导入的是别处的数据，当前登录的管理账号已不存在，必须重新登录
+            session.clear()
+            return jsonify({"imported": True, "relogin": True, "backup": backup, "tables": inserted})
+        return jsonify({
+            "imported": True,
+            "relogin": False,
+            "backup": backup,
+            "tables": inserted,
+            "state": state_payload(conn, current_user(conn)),
+        })
 
 
 @app.get("/api/setup/status")
@@ -1148,15 +1690,20 @@ def setup_admin():
 
 @app.post("/api/auth/login")
 def login():
+    remote = request.remote_addr or "unknown"
+    if login_rate_limited(remote):
+        return api_error("登录尝试过于频繁，请稍后再试", 429)
     payload = request.get_json(silent=True) or {}
     username = str(payload.get("username", "")).strip()
     password = str(payload.get("password", ""))
     with connection() as conn:
         user = conn.execute("SELECT * FROM accounts WHERE username = ? AND active = 1", (username,)).fetchone()
         if user is None or not password_matches(password, user["password_hash"]):
+            record_failed_login(remote)
             return api_error("账号或密码错误", 401)
         session.clear()
         session["user_id"] = int(user["id"])
+        clear_failed_logins(remote)
         if user["role"] == "admin":
             first_child = conn.execute("SELECT id FROM accounts WHERE role = 'child' AND active = 1 ORDER BY id LIMIT 1").fetchone()
             if first_child:
@@ -1331,11 +1878,15 @@ def create_account():
         return api_error("头像类型无效")
     if not display_name:
         display_name = username
+    try:
+        daily_submit_limit = normalize_submit_limit(payload.get("daily_submit_limit"))
+    except ValueError as exc:
+        return api_error(str(exc))
     with connection() as conn:
         try:
             cursor = conn.execute(
-                "INSERT INTO accounts(username, password_hash, display_name, role, avatar, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (username, password_hash(password), display_name, role, avatar, datetime.now().astimezone().isoformat(timespec="seconds")),
+                "INSERT INTO accounts(username, password_hash, display_name, role, avatar, daily_submit_limit, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (username, password_hash(password), display_name, role, avatar, daily_submit_limit, datetime.now().astimezone().isoformat(timespec="seconds")),
             )
         except sqlite3.IntegrityError:
             return api_error("账号名已存在")
@@ -1400,7 +1951,7 @@ def delete_account(account_id: int):
                 datetime.now().astimezone().isoformat(timespec="seconds"),
             ),
         )
-        for table in ("earn_items", "deduct_items", "rewards", "records", "point_requests", "task_assignments", "account_achievements"):
+        for table in ("earn_items", "deduct_items", "rewards", "records", "point_requests", "task_assignments", "task_submit_log", "account_achievements"):
             conn.execute(f"DELETE FROM {table} WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM app_settings WHERE key = ?", (adventure_level_key(account_id),))
         conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
@@ -1420,6 +1971,12 @@ def update_account(account_id: int):
         return api_error("显示名称不能为空")
     if password and len(password) < 6:
         return api_error("密码至少需要 6 位")
+    submit_limit = None
+    if payload.get("daily_submit_limit") is not None:
+        try:
+            submit_limit = normalize_submit_limit(payload.get("daily_submit_limit"))
+        except ValueError as exc:
+            return api_error(str(exc))
     with connection() as conn:
         user = current_user(conn)
         target = conn.execute("SELECT * FROM accounts WHERE id = ? AND active = 1", (account_id,)).fetchone()
@@ -1435,6 +1992,9 @@ def update_account(account_id: int):
         if password:
             assignments.append("password_hash = ?")
             values.append(password_hash(password))
+        if submit_limit is not None and target["role"] == "child":
+            assignments.append("daily_submit_limit = ?")
+            values.append(submit_limit)
         values.append(account_id)
         conn.execute(f"UPDATE accounts SET {', '.join(assignments)} WHERE id = ?", values)
         target = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
@@ -1546,6 +2106,7 @@ def create_task():
         reward_coins = positive_int(payload.get("reward_coins"), "积分奖励")
         reward_exp = positive_int(payload.get("reward_exp"), "经验奖励")
         due_date = valid_date(due_date_value) if due_date_value else None
+        repeat_rule = normalize_repeat_rule(payload, task_type)
     except ValueError as exc:
         return api_error(str(exc))
     if not title:
@@ -1562,8 +2123,9 @@ def create_task():
             """
             INSERT INTO tasks(
                 title, description, category, task_type, difficulty,
-                reward_coins, reward_exp, icon, due_date, created_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reward_coins, reward_exp, icon, due_date, created_by, created_at,
+                repeat_freq, repeat_days, repeat_month_week, repeat_start, repeat_end
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 title,
@@ -1577,6 +2139,11 @@ def create_task():
                 due_date,
                 user["id"],
                 datetime.now().astimezone().isoformat(timespec="seconds"),
+                repeat_rule["repeat_freq"],
+                repeat_rule["repeat_days"],
+                repeat_rule["repeat_month_week"],
+                repeat_rule["repeat_start"],
+                repeat_rule["repeat_end"],
             ),
         )
         task = conn.execute("SELECT * FROM tasks WHERE id = ?", (cursor.lastrowid,)).fetchone()
@@ -1594,6 +2161,13 @@ def task_detail(task_id: int):
         if request.method == "DELETE":
             conn.execute("UPDATE tasks SET is_active = 0 WHERE id = ?", (task_id,))
             return jsonify({"deleted": True})
+        # v0.13.2：任务已有审核通过的提交 → 规则已生效，禁止再编辑（前端同时隐藏「编辑」按钮）
+        approved = conn.execute(
+            "SELECT COUNT(*) AS total FROM task_assignments WHERE task_id = ? AND status = 'completed'",
+            (task_id,),
+        ).fetchone()["total"]
+        if task_is_edit_locked(task["task_type"], int(approved or 0)):
+            return api_error("该任务已有审核通过的提交，不能再编辑", 409)
         payload = request.get_json(silent=True) or {}
         title = str(payload.get("title", "")).strip()[:80]
         description = str(payload.get("description", "")).strip()[:240]
@@ -1606,6 +2180,17 @@ def task_detail(task_id: int):
             reward_coins = positive_int(payload.get("reward_coins", task["reward_coins"]), "积分奖励")
             reward_exp = positive_int(payload.get("reward_exp", task["reward_exp"]), "经验奖励")
             due_date = valid_date(due_date_value) if due_date_value else None
+            # 未传的重复字段回退到原值，避免局部更新把规则清空
+            repeat_rule = normalize_repeat_rule(
+                {
+                    "repeat_freq": payload.get("repeat_freq", task["repeat_freq"]),
+                    "repeat_days": payload.get("repeat_days", task["repeat_days"]),
+                    "repeat_month_week": payload.get("repeat_month_week", task["repeat_month_week"]),
+                    "repeat_start": payload.get("repeat_start", task["repeat_start"]),
+                    "repeat_end": payload.get("repeat_end", task["repeat_end"]),
+                },
+                task_type,
+            )
         except ValueError as exc:
             return api_error(str(exc))
         if not title:
@@ -1617,10 +2202,27 @@ def task_detail(task_id: int):
         conn.execute(
             """
             UPDATE tasks SET title = ?, description = ?, category = ?, task_type = ?, difficulty = ?,
-                reward_coins = ?, reward_exp = ?, icon = ?, due_date = ?
+                reward_coins = ?, reward_exp = ?, icon = ?, due_date = ?,
+                repeat_freq = ?, repeat_days = ?, repeat_month_week = ?, repeat_start = ?, repeat_end = ?
             WHERE id = ?
             """,
-            (title, description, category, task_type, difficulty, reward_coins, reward_exp, icon, due_date, task_id),
+            (
+                title,
+                description,
+                category,
+                task_type,
+                difficulty,
+                reward_coins,
+                reward_exp,
+                icon,
+                due_date,
+                repeat_rule["repeat_freq"],
+                repeat_rule["repeat_days"],
+                repeat_rule["repeat_month_week"],
+                repeat_rule["repeat_start"],
+                repeat_rule["repeat_end"],
+                task_id,
+            ),
         )
         return jsonify(state_payload(conn, user))
 
@@ -1638,6 +2240,8 @@ def claim_task(task_id: int):
         today = current_date()
         if task["due_date"] and task["due_date"] < today:
             return api_error("这个任务已经过期", 409)
+        if task["task_type"] == "repeat" and not repeat_matches(task, date.fromisoformat(today)):
+            return api_error("这个任务今天不触发，到那天会自动出现", 409)
         if task["task_type"] == "epic":
             existing = conn.execute(
                 "SELECT 1 FROM task_assignments WHERE task_id = ? AND account_id = ? AND status IN ('claimed', 'submitted', 'completed')",
@@ -1645,10 +2249,14 @@ def claim_task(task_id: int):
             ).fetchone()
         else:
             existing = conn.execute(
-                "SELECT 1 FROM task_assignments WHERE task_id = ? AND account_id = ? AND claim_date = ? AND status IN ('claimed', 'submitted', 'completed')",
+                "SELECT status FROM task_assignments WHERE task_id = ? AND account_id = ? AND claim_date = ?",
                 (task_id, user["id"], today),
             ).fetchone()
         if existing is not None:
+            # 当天已有记录：若被退回，引导直接重新提交，避免撞 UNIQUE(task_id, account_id, claim_date)
+            status = existing["status"] if "status" in existing.keys() else None
+            if status == "rejected":
+                return api_error("这个任务已被退回，请直接重新提交", 409)
             return api_error("你已经领取过这个任务", 409)
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         cursor = conn.execute(
@@ -1674,9 +2282,27 @@ def submit_task(assignment_id: int):
             return api_error("任务领取记录不存在", 404)
         if assignment["status"] not in ("claimed", "rejected"):
             return api_error("当前任务状态不能提交", 409)
+        # v0.11.0 每日提交审核额度：按「当天提交总次数」计数，被退回后重新提交也算一次。
+        today = current_date()
+        limit = daily_submit_limit_for(conn, int(user["id"]))
+        if limit:
+            used = submit_count_today(conn, int(user["id"]), today)
+            if used >= limit:
+                return api_error(
+                    f"今天的提交审核次数已用完（每天 {limit} 次），明天再来吧；也可以请家长调整这个额度。",
+                    429,
+                )
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
         conn.execute(
             "UPDATE task_assignments SET status = 'submitted', submitted_at = ?, review_note = NULL WHERE id = ?",
-            (datetime.now().astimezone().isoformat(timespec="seconds"), assignment_id),
+            (now, assignment_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_submit_log(account_id, task_id, assignment_id, submit_date, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user["id"], assignment["task_id"], assignment_id, today, now),
         )
         return jsonify(state_payload(conn, user))
 
@@ -2075,3 +2701,5 @@ init_db()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "9696")), debug=False)
+
+

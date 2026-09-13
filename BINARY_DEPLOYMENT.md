@@ -40,6 +40,15 @@ chmod +x RewardHub
 PORT=9696 DATA_DIR=/opt/rewardhub-data ./RewardHub
 ```
 
+安全相关环境变量（公网部署前务必设置）：
+
+```bash
+# 覆盖默认签名密钥，避免会话被伪造（请替换为随机长字符串）
+SECRET_KEY="$(head -c 32 /dev/urandom | base64)"
+# 公网部署时开启，仅允许通过 HTTPS 传输会话 Cookie
+COOKIE_SECURE=1
+```
+
 ## Windows
 
 下载 Windows 压缩包，解压后双击 `RewardHub.exe`，或在 PowerShell 中运行：
@@ -54,3 +63,11 @@ $env:PORT = "9696"
 打开：`http://127.0.0.1:9696`
 
 二进制包是 x86_64/amd64 架构。ARM 设备和飞牛 NAS 继续使用 Docker 镜像部署。
+
+Windows 同样支持安全环境变量（在启动前设置）：
+
+```powershell
+$env:SECRET_KEY = "替换为随机长字符串"
+$env:COOKIE_SECURE = "1"
+.\RewardHub.exe
+```

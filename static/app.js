@@ -11,9 +11,26 @@ const appState = {
   accountEditId: null,
   announcementEditId: null,
   announcementPopupTimer: null,
+  // v0.13.0 长页面收纳：总览分 Tab、通知发布表单折叠、账户明细折叠、设置页分 Tab
+  homeTab: "overview",
+  settingsTab: "project",
+  itemTab: "earn",
+  announcementFormOpen: false,
+  accountDetailOpen: false,
+  // v0.13.2 账号管理页：每个账号一张可折叠卡片，这里记住哪些是展开的（重渲染后不丢）
+  openAccounts: {},
+  // v0.13.5 任务页：已完成任务折叠归档（展开状态）+ 批量删除的勾选项（存任务 id）
+  questDoneOpen: false,
+  pickedDoneTasks: [],
+  // 冒险等级 / 积分换钱两个表单面板默认折叠（其余三个项目面板已改为 Tab 切换）
+  settingsPanels: { level: false, currency: false },
 };
 
 let confirmResolver = null;
+
+// 每日提交审核额度（v0.11.0）：0 = 不限制；后端默认值与此保持一致
+const DEFAULT_SUBMIT_LIMIT = 10;
+const MAX_SUBMIT_LIMIT = 999;
 
 const CUSTOM_IMAGES = {
   "child-boy": { src: "/custom-assets/child-boy", fallback: "/static/avatars/boy.svg" },
@@ -189,6 +206,34 @@ async function api(url, options = {}) {
   return payload;
 }
 
+// ---- 多设备同步（v0.10.0）----
+// 典型场景是「家长手机发布任务、孩子平板查看」，孩子端必须能自己拿到最新数据，
+// 不能只依赖整页刷新。切换页面 / 回到前台 / 定时都会静默拉一次最新状态。
+let stateSyncAt = 0;
+let stateSyncing = false;
+const STATE_SYNC_MIN_INTERVAL = 3000;
+
+async function syncState({ force = false } = {}) {
+  if (!appState.data || stateSyncing) return;
+  const elapsed = Date.now() - stateSyncAt;
+  if (elapsed < 1000) return;                        // 同一瞬间（如 loadState 后紧跟导航）不重复请求
+  if (!force && elapsed < STATE_SYNC_MIN_INTERVAL) return;
+  stateSyncing = true;
+  stateSyncAt = Date.now();
+  try {
+    const data = await api("/api/state", { cache: "no-store" });
+    if (!data) return;
+    appState.data = data;
+    if (data.user?.role === "admin") appState.accounts = (await api("/api/accounts")).accounts;
+    render();
+  } catch (error) {
+    // 静默失败：会话失效才切回登录页，其余交给顶栏连接指示器
+    if (error.status === 401) showLogin();
+  } finally {
+    stateSyncing = false;
+  }
+}
+
 async function loadState() {
   try {
     const setup = await api("/api/setup/status");
@@ -202,7 +247,10 @@ async function loadState() {
     } else {
       appState.accounts = [];
     }
+    stateSyncAt = Date.now();
     showApp();
+    const initialHash = location.hash.replace(/^#/, "").trim();
+    if (initialHash) appState.page = initialHash;
     navigate(appState.page);
   } catch (error) {
     if (error.status === 401) showLogin();
@@ -217,7 +265,8 @@ function showApp() {
   document.getElementById("app-header").classList.remove("hidden");
   document.getElementById("app-shell").classList.remove("hidden");
   document.getElementById("bottom-nav").classList.remove("hidden");
-  document.getElementById("connection-state").textContent = "数据库已连接";
+  const indicator = document.getElementById("connection-state");
+  if (indicator && !indicator.dataset.monitorReady) indicator.textContent = "连接中…";
 }
 
 function showLogin() {
@@ -263,7 +312,6 @@ function updateAccountUi() {
   document.querySelectorAll(".child-only").forEach((element) => element.classList.toggle("hidden", isAdmin));
   document.getElementById("account-label").textContent = user ? `${user.display_name} · ${isAdmin ? "管理账号" : "孩子账号"}` : "";
   setImageSource(document.getElementById("user-avatar"), avatarSource(user?.avatar), avatarFallback(user?.avatar));
-  document.getElementById("nav-requests-label").textContent = isAdmin ? "审核" : "申请";
   const selector = document.getElementById("child-select");
   const children = appState.data.children || [];
   if (isAdmin) {
@@ -277,13 +325,63 @@ function updateAccountUi() {
 
 function navigate(page) {
   const isAdmin = appState.data?.user?.role === "admin";
-  const adminPages = ["deduct", "accounts", "settings"];
+  if (page === "requests") page = "records";
+  const adminPages = ["points", "accounts", "settings"];
   if (adminPages.includes(page) && !isAdmin) page = "home";
+  if (page !== "quests" && appState.taskEditId) {
+    appState.taskEditId = null;
+    resetQuestForm();
+  }
   appState.page = page;
   document.querySelectorAll(".page").forEach((element) => element.classList.toggle("active", element.dataset.page === page));
   document.querySelectorAll(".nav-button").forEach((element) => element.classList.toggle("active", element.dataset.pageTarget === page));
   render();
+  // 任务页是「家长发布、孩子查看」跨设备刷新最敏感的地方，进入时强制同步一次
+  syncState({ force: page === "quests" });
   window.scrollTo({ top: 0, behavior: "smooth" });
+  if (location.hash.slice(1) !== page) location.hash = page;
+}
+
+window.addEventListener("hashchange", () => {
+  const page = location.hash.slice(1) || "home";
+  if (page === appState.page) return;
+  navigate(page);
+});
+
+let opKind = "earn";
+function setOpKind(kind) {
+  opKind = kind;
+  const form = document.getElementById("points-form");
+  if (!form) return;
+  form.dataset.kind = kind;
+  const submit = document.getElementById("points-submit");
+  const nameInput = form.elements.name;
+  if (kind === "earn") {
+    submit.textContent = "确认加积分";
+    submit.className = "button button-primary";
+    nameInput.placeholder = "加积分说明，例如：完成作业";
+  } else {
+    submit.textContent = "确认扣积分";
+    submit.className = "button button-danger";
+    nameInput.placeholder = "扣积分说明，例如：未完成任务";
+  }
+  document.querySelectorAll(".operation-toggle .toggle-button").forEach((btn) => {
+    const active = btn.dataset.opKind === kind;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-pressed", String(active));
+  });
+}
+
+let itemKind = "earn";
+function setItemKind(kind) {
+  itemKind = kind;
+  document.querySelectorAll("#items-toggle .toggle-button").forEach((btn) => {
+    const active = btn.dataset.itemKind === kind;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-pressed", String(active));
+  });
+  document.getElementById("earn-items-panel")?.classList.toggle("hidden", kind !== "earn");
+  document.getElementById("deduct-items-panel")?.classList.toggle("hidden", kind !== "deduct");
 }
 
 function render() {
@@ -299,8 +397,10 @@ function render() {
   renderExchangeList();
   renderManagement();
   renderRequests();
+  renderTaskReviews();
   renderQuests();
   renderQuestFocus();
+  renderSubmitQuota();
   renderAnnouncements();
   renderAchievements();
   renderAccounts();
@@ -308,6 +408,96 @@ function render() {
   updateCurrencyUi();
   updateCashExchangeDiscount();
   updateCashExchangePreview();
+  applyTableLabels();
+  syncHomeTabs();
+  syncSettingsTabs();
+  syncItemTabs();
+  syncAnnouncementEditor();
+  syncAccountDetail();
+  syncSettingsPanels();
+  detectCelebration(appState.data);
+  setOpKind(opKind);
+  setItemKind(itemKind);
+}
+
+// v0.12.0 长页面收纳 ----------
+// 总览分区 Tab：角色不可用的 Tab（孩子端的「账户」）由 .admin-only 的 hidden 控制，
+// 面板可见性只在这里统一决定，避免出现「Tab 被藏了但面板还露着」。
+function syncHomeTabs() {
+  const tabs = [...document.querySelectorAll("#home-tabs .home-tab")];
+  if (!tabs.length) return;
+  const available = tabs.filter((tab) => !tab.classList.contains("hidden"));
+  const keys = available.map((tab) => tab.dataset.homeTab);
+  if (!keys.includes(appState.homeTab)) appState.homeTab = keys[0] || "overview";
+  tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.homeTab === appState.homeTab));
+  document.querySelectorAll("[data-home-panel]").forEach((panel) => {
+    panel.classList.toggle("panel-off", panel.dataset.homePanel !== appState.homeTab);
+  });
+}
+
+// v0.13.0：设置页分区 Tab（项目设置 / 管理工具）。
+// 只有 #settings-tabs 里的按钮参与「选中态」，所以每个 sync 都只查 Tab 栏，避免误伤普通按钮。
+function syncSettingsTabs() {
+  const tabs = [...document.querySelectorAll("#settings-tabs [data-settings-tab]")];
+  const panels = [...document.querySelectorAll("[data-settings-tab-panel]")];
+  if (!tabs.length && !panels.length) return;
+  const keys = tabs.map((tab) => tab.dataset.settingsTab);
+  if (keys.length && !keys.includes(appState.settingsTab)) appState.settingsTab = keys[0];
+  tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.settingsTab === appState.settingsTab));
+  panels.forEach((panel) => {
+    panel.classList.toggle("panel-off", panel.dataset.settingsTabPanel !== appState.settingsTab);
+  });
+}
+
+// v0.13.0：三个项目面板（加积分 / 扣积分 / 兑换奖励）改用 Tab 切换，不再折叠。
+function syncItemTabs() {
+  const tabs = [...document.querySelectorAll("#item-tabs [data-item-tab]")];
+  if (!tabs.length) return;
+  const keys = tabs.map((tab) => tab.dataset.itemTab);
+  if (!keys.includes(appState.itemTab)) appState.itemTab = keys[0] || "earn";
+  tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.itemTab === appState.itemTab));
+  document.querySelectorAll("[data-item-tab-panel]").forEach((panel) => {
+    panel.classList.toggle("panel-off", panel.dataset.itemTabPanel !== appState.itemTab);
+  });
+}
+
+// 通知发布表单默认收起；进入编辑态时强制展开，否则找不到表单。
+function syncAnnouncementEditor() {
+  const editor = document.getElementById("announcement-editor");
+  const toggle = document.getElementById("toggle-announcement-editor");
+  if (!editor || !toggle) return;
+  const open = Boolean(appState.announcementFormOpen) || Boolean(appState.announcementEditId);
+  editor.classList.toggle("is-collapsed", !open);
+  toggle.textContent = open ? "收起发布框" : "＋ 发布通知";
+  toggle.setAttribute("aria-expanded", String(open));
+}
+
+// 账户明细列（折合金额 / 今日变化 / 状态）默认收起，只留账户、当前积分、待审核。
+function syncAccountDetail() {
+  const table = document.getElementById("home-account-table");
+  const toggle = document.getElementById("toggle-account-detail");
+  if (!table || !toggle) return;
+  const open = Boolean(appState.accountDetailOpen);
+  table.classList.toggle("is-compact", !open);
+  toggle.textContent = open ? "收起明细" : "展开明细";
+  toggle.setAttribute("aria-expanded", String(open));
+}
+
+// 冒险等级 / 积分换钱两个表单面板折叠（v0.13.0 起只有这两个还用折叠）。
+function syncSettingsPanels() {
+  document.querySelectorAll("[data-settings-panel]").forEach((panel) => {
+    const open = Boolean(appState.settingsPanels[panel.dataset.settingsPanel]);
+    const list = panel.querySelector(".item-list");
+    const count = panel.querySelectorAll(".item-list .list-row").length;
+    // 空的项目面板自动展开：只有一行「暂无项目」提示，撑不长页面，还能直接引导新增。
+    // 等级 / 换钱两个表单面板没有 .item-list，始终跟随 appState。
+    const effectiveOpen = open || (Boolean(list) && count === 0);
+    panel.classList.toggle("is-collapsed", !effectiveOpen);
+    const toggle = panel.querySelector("[data-toggle-settings-panel]");
+    if (!toggle) return;
+    toggle.textContent = effectiveOpen ? "收起" : list ? `展开 · ${count} 项` : "展开";
+    toggle.setAttribute("aria-expanded", String(effectiveOpen));
+  });
 }
 
 function activeAccount() {
@@ -325,7 +515,9 @@ function renderHome() {
   const income = todayRecords.filter((record) => record.type === "income").reduce((sum, record) => sum + Number(record.amount), 0);
   const expense = Math.abs(todayRecords.filter((record) => record.type === "expense").reduce((sum, record) => sum + Number(record.amount), 0));
   const children = (data.account_overview || []).filter((item) => item.role === "child");
-  const pending = children.reduce((sum, item) => sum + Number(item.pending_count), 0);
+  // v0.10.1：待办口径 = 积分申请(pending_count) + 任务验收(task_pending_count)，与「审核中心」一致
+  const childPending = (item) => Number(item.pending_count) + Number(item.task_pending_count || 0);
+  const pending = children.reduce((sum, item) => sum + childPending(item), 0);
   const weekTotal = dayNames.reduce((sum, _, index) => {
     const current = new Date();
     const day = current.getDay() || 7;
@@ -345,15 +537,16 @@ function renderHome() {
   document.getElementById("active-account-kicker").textContent = user.role === "admin" ? "当前操作对象" : "我的账号";
   document.getElementById("total-points").textContent = Number(data.total_points || 0).toLocaleString("zh-CN");
   document.getElementById("total-money").textContent = `折合 ${moneyText(data.total_points)}`;
-  document.getElementById("earn-target-name").textContent = account.display_name || "暂无孩子账号";
-  document.getElementById("deduct-target-name").textContent = account.display_name || "暂无孩子账号";
+  document.getElementById("points-target-name").textContent = account.display_name || "暂无孩子账号";
   document.getElementById("pending-action-label").textContent = `${pending} 条待处理`;
   document.querySelector(".hero-actions.admin-only")?.classList.toggle("hidden", user.role !== "admin" || !hasChild);
   document.getElementById("no-child-panel")?.classList.toggle("hidden", !(user.role === "admin" && !hasChild));
+  const familyPoints = children.reduce((sum, item) => sum + Number(item.total_points), 0);
   const metrics = user.role === "admin" ? [
     ["孩子账户", children.length, "个", "metric-green"],
-    ["家庭总积分", children.reduce((sum, item) => sum + Number(item.total_points), 0), "分", "metric-blue"],
-    ["待审核申请", pending, "条", pending ? "metric-orange" : "metric-green"],
+    // v0.12.0：banner 里那组重复的合计卡已删，折合金额并进这张卡的单位位，信息不丢
+    ["家庭总积分", familyPoints.toLocaleString("zh-CN"), moneyText(familyPoints), "metric-blue"],
+    ["待审核事项", pending, "条", pending ? "metric-orange" : "metric-green"],
     ["本周变化", signed(weekTotal), "积分", weekTotal >= 0 ? "metric-green" : "metric-red"],
   ] : [
     ["今日赚取积分", income, "分", "metric-green"],
@@ -375,7 +568,7 @@ function renderHome() {
   if (controlPendingCount) controlPendingCount.textContent = pending;
   const homeSummary = document.getElementById("home-account-summary");
   if (homeSummary) {
-    homeSummary.innerHTML = children.length ? children.map((child) => `<tr><td><div class="table-person">${avatarImage(child.avatar, "avatar avatar-table", child.display_name)}<div><strong>${escapeHtml(child.display_name)}</strong><small>${escapeHtml(child.username)}</small></div></div></td><td class="table-number">${Number(child.total_points).toLocaleString("zh-CN")}</td><td class="table-number">${moneyText(child.total_points)}</td><td class="table-number ${Number(child.today_net) >= 0 ? "income" : "expense"}">${signed(child.today_net)}</td><td><span class="pending-badge">${Number(child.pending_count)}</span></td><td><span class="status-pill ${Number(child.pending_count) ? "status-pending" : "status-approved"}">${Number(child.pending_count) ? "待审核" : "运行正常"}</span></td></tr>`).join("") : `<tr><td colspan="6"><div class="empty-state">暂无孩子账号，请先创建账号</div></td></tr>`;
+    homeSummary.innerHTML = children.length ? children.map((child) => { const childTotal = childPending(child); return `<tr><td><div class="table-person">${avatarImage(child.avatar, "avatar avatar-table", child.display_name)}<div><strong>${escapeHtml(child.display_name)}</strong><small>${escapeHtml(child.username)}</small></div></div></td><td class="table-number">${Number(child.total_points).toLocaleString("zh-CN")}</td><td class="table-number account-detail">${moneyText(child.total_points)}</td><td class="table-number account-detail ${Number(child.today_net) >= 0 ? "income" : "expense"}">${signed(child.today_net)}</td><td><span class="pending-badge">${childTotal}</span></td><td class="account-detail"><span class="status-pill ${childTotal ? "status-pending" : "status-approved"}">${childTotal ? "待审核" : "运行正常"}</span></td></tr>`; }).join("") : `<tr><td colspan="6"><div class="empty-state">暂无孩子账号，请先创建账号</div></td></tr>`;
   }
   renderWeekGrid(document.getElementById("home-week-grid"), "home-week-title");
   const preview = document.getElementById("home-request-preview");
@@ -437,6 +630,13 @@ function renderAdventureSettings(data) {
   form.elements.mode.value = manual ? "manual" : "auto";
   form.elements.level.value = manual ? settings.manual_adventure_level : (data.gamification?.level || 1);
   form.elements.level.disabled = !manual;
+  // 折叠状态下也要能看到当前等级配置
+  const summary = document.getElementById("adventure-level-summary");
+  if (summary) {
+    summary.textContent = manual
+      ? `手动指定：LV ${settings.manual_adventure_level}`
+      : `自动计算：LV ${data.gamification?.level || 1}（按任务经验）`;
+  }
 }
 
 function renderEarnLists() {
@@ -494,21 +694,59 @@ function requestMarkup(request) {
 
 function renderRequests() {
   const isAdmin = appState.data.user.role === "admin";
-  document.getElementById("requests-title").textContent = isAdmin ? "审核申请" : "我的申请";
+  document.getElementById("requests-title").textContent = isAdmin ? "积分申请" : "我的申请";
   document.getElementById("requests-subtitle").textContent = isAdmin ? "孩子提交的赚积分或兑换申请，审核后才会更新余额。" : "申请不会直接改变余额，等待管理账号审核。";
   const requests = appState.data.requests || [];
   document.getElementById("requests-list").innerHTML = requests.length ? requests.map(requestMarkup).join("") : `<div class="empty-state">暂无申请记录</div>`;
 }
 
+// v0.10.1：管理端「审核中心」的任务验收队列。
+// 此前孩子提交验收后，管理端只能到任务页每张卡片的人员小列表里逐个点，缺少集中的待办入口，
+// 于是「记录页看不到需要审核的」。这里把 status='submitted' 的提交汇总成一条待办列表，
+// 复用任务页已有的 approve-task / reject-task 动作。
+function taskReviewMarkup(review) {
+  const childName = review.child_name || "孩子";
+  const submitted = String(review.submitted_at || "");
+  const submittedTime = submitted.length >= 16 ? submitted.slice(11, 16) : "";
+  const withdrawn = review.task_active === false ? " · 任务已撤下" : "";
+  return `<div class="request-row"><div class="request-person">${avatarImage(review.child_avatar || "boy", "avatar avatar-small", childName)}<div><strong>任务验收：${escapeHtml(review.task_title)}</strong><span>${escapeHtml(childName)} · ${escapeHtml(review.claim_date)}${submittedTime ? ` ${escapeHtml(submittedTime)}` : ""} 提交${withdrawn}</span></div></div><strong class="request-amount income">${signed(review.reward_coins)} 积分</strong><div class="row-actions"><button class="button button-small button-primary" data-action="approve-task" data-id="${review.assignment_id}" type="button">通过</button><button class="button button-small button-outline-danger" data-action="reject-task" data-id="${review.assignment_id}" type="button">重做</button></div></div>`;
+}
+
+function renderTaskReviews() {
+  const list = document.getElementById("task-review-list");
+  if (!list) return;
+  const reviews = appState.data.task_reviews || [];
+  const pendingRequests = (appState.data.requests || []).filter((request) => (request.status || "pending") === "pending").length;
+  const subtitle = document.getElementById("review-subtitle");
+  if (appState.data.user.role === "admin") {
+    document.getElementById("task-review-title").textContent = reviews.length ? `任务验收（${reviews.length}）` : "任务验收";
+    document.getElementById("task-review-subtitle").textContent = reviews.length ? "孩子已完成、等待你验收的任务。" : "当前没有等待验收的任务提交。";
+    if (subtitle) subtitle.textContent = reviews.length || pendingRequests ? `待处理：任务验收 ${reviews.length} 项 · 积分申请 ${pendingRequests} 项。` : "当前没有待处理的审核事项。";
+  } else if (subtitle) {
+    subtitle.textContent = "查看积分的每日变化，以及你提交的申请进度。";
+  }
+  list.innerHTML = reviews.length ? reviews.map(taskReviewMarkup).join("") : `<div class="empty-state">暂无待验收的任务</div>`;
+}
+
 const TASK_DIFFICULTY_TEXT = { easy: "简单", normal: "普通", hard: "困难", legendary: "传说" };
-const TASK_TYPE_TEXT = { daily: "日常任务", epic: "史诗悬赏" };
+const TASK_TYPE_TEXT = { daily: "日常任务", repeat: "重复任务", epic: "史诗悬赏" };
 const TASK_STATUS_TEXT = { claimed: "已领取", submitted: "待验收", completed: "已完成", rejected: "需重做" };
 
 function taskActionMarkup(task) {
   const isAdmin = appState.data.user.role === "admin";
   if (isAdmin) {
     const pending = (task.assignments || []).filter((assignment) => assignment.status === "submitted");
-    return pending.length ? `<span class="quest-status quest-status-submitted">${pending.length} 人待验收</span>` : `<span class="muted">${task.participant_count || 0} 人参与</span>`;
+    const status = pending.length ? `<span class="quest-status quest-status-submitted">${pending.length} 人待验收</span>` : `<span class="muted">${task.participant_count || 0} 人参与</span>`;
+    // v0.13.2：已有「审核通过」的提交后，任务规则已生效，不允许再编辑（服务端同样拦截）。
+    const editButton = task.edit_locked
+      ? `<span class="quest-status quest-status-completed" title="已有审核通过的提交，任务规则不能再修改">已验收 · 不可编辑</span>`
+      : `<button class="button button-small button-outline" data-action="edit-task" data-id="${task.id}" type="button">编辑</button>`;
+    return `<div class="row-actions">${status}${editButton}<button class="button button-small button-outline-danger" data-action="delete-task" data-id="${task.id}" type="button">删除</button></div>`;
+  }
+  // 重复任务今天不触发、但计划还没结束：提前告诉孩子下次什么时候开始，且不可领取
+  if (task.task_type === "repeat" && task.active_today === false) {
+    const next = String(task.next_date || "").slice(5);
+    return `<span class="quest-status quest-status-upcoming">未开始${next ? ` · 下次 ${escapeHtml(next)}` : ""}</span>`;
   }
   const assignment = task.my_assignment;
   if (!assignment) return `<button class="button button-small button-primary" data-action="claim-task" data-id="${task.id}" type="button">领取任务</button>`;
@@ -522,28 +760,96 @@ function questAssignmentMarkup(assignment) {
   return `<div class="quest-assignee"><span>${escapeHtml(assignment.account_name)} · ${escapeHtml(assignment.claim_date)}</span>${controls}</div>`;
 }
 
+function questCardMarkup(task, options = {}) {
+  const { done = false } = options;
+  const isAdmin = appState.data.user.role === "admin";
+  const assignments = isAdmin && task.assignments?.length ? `<div class="quest-assignees">${task.assignments.map(questAssignmentMarkup).join("")}</div>` : "";
+  const rewardCoins = Number(task.reward_coins);
+  const baseReward = Number(task.base_reward_coins || rewardCoins);
+  const rewardNote = baseReward !== rewardCoins ? `<small class="quest-reward-note">基础 ${baseReward.toLocaleString("zh-CN")}</small>` : "";
+  const isRepeat = task.task_type === "repeat";
+  const pausedToday = isRepeat && !task.active_today;
+  // 「今日不触发」是管理视角的提示；孩子端由操作区的「未开始 · 下次 X」表达，避免重复
+  const restChip = pausedToday && isAdmin ? `<span class="quest-rest">今日不触发</span>` : "";
+  const metaRight = isRepeat
+    ? `<span class="quest-repeat">↻ ${escapeHtml(task.repeat_text || "重复任务")}</span>${restChip}`
+    : `<span class="muted">${task.due_date ? `截止 ${escapeHtml(task.due_date)}` : "长期有效"}</span>`;
+  // v0.13.5：归档里的卡片给管理端一个勾选框，用于批量删除
+  const pick = done && isAdmin
+    ? `<label class="quest-pick" title="勾选后可批量删除"><input type="checkbox" data-pick-task="${task.id}"${appState.pickedDoneTasks.includes(Number(task.id)) ? " checked" : ""}></label>`
+    : "";
+  return `<article class="quest-card${task.task_type === "epic" ? " epic" : ""}${isRepeat ? " repeat" : ""}${pausedToday ? " resting" : ""}${done ? " is-done" : ""}"><div class="quest-card-head">${pick}<div class="quest-card-title">${iconMarkup(task.icon, "earn", "quest-icon") }<div><h2>${escapeHtml(task.title)}</h2><p>${escapeHtml(task.category)} · ${TASK_TYPE_TEXT[task.task_type] || task.task_type}</p></div></div><span class="quest-rarity">${TASK_DIFFICULTY_TEXT[task.difficulty] || task.difficulty}</span></div><p class="quest-description">${escapeHtml(task.description || "完成任务后提交，等待管理员验收。")}</p><div class="quest-card-meta"><span class="quest-reward">◆ ${rewardCoins.toLocaleString("zh-CN")} 积分${rewardNote}</span><span class="quest-reward">✦ ${Number(task.reward_exp).toLocaleString("zh-CN")} XP</span>${metaRight}</div><div class="quest-card-actions">${taskActionMarkup(task)}</div>${assignments}</article>`;
+}
+
+// v0.13.5：已完成任务折叠归档 —— 管理端=该任务的全部提交都已验收、没有进行中的；
+// 孩子端=最近一次提交已通过。归档默认收起，展开后管理端可勾选批量删除。
+function questDoneSection(doneTasks) {
+  const isAdmin = appState.data.user.role === "admin";
+  const picked = appState.pickedDoneTasks;
+  const allPicked = doneTasks.length > 0 && doneTasks.every((task) => picked.includes(Number(task.id)));
+  return `<details class="content-panel quest-done-panel collapsible-panel" id="quest-done-panel"${appState.questDoneOpen ? " open" : ""}>
+    <summary class="collapsible-summary"><span class="section-copy"><span class="eyebrow">任务归档</span><strong class="section-copy-title">已完成任务（${doneTasks.length}）</strong></span><span aria-hidden="true" class="collapsible-caret">▾</span></summary>
+    ${isAdmin ? `<div class="row-actions quest-done-tools"><label class="quest-pick"><input type="checkbox" id="quest-pick-all"${allPicked ? " checked" : ""}><span>全选</span></label><button class="button button-small button-outline-danger" data-action="batch-delete-tasks" type="button"${picked.length ? "" : " disabled"}>删除所选${picked.length ? `（${picked.length}）` : ""}</button></div>` : ""}
+    <div class="quest-board quest-done-list">${doneTasks.map((task) => questCardMarkup(task, { done: true })).join("")}</div>
+  </details>`;
+}
+
 function renderQuests() {
   const list = document.getElementById("quest-list");
   if (!list) return;
+  const isAdmin = appState.data.user.role === "admin";
   const tasks = appState.data.tasks || [];
   if (!tasks.length) {
-    list.innerHTML = `<div class="content-panel empty-state">暂无悬赏任务，管理员可以在上方发布第一个任务。</div>`;
+    list.innerHTML = isAdmin
+      ? `<div class="content-panel empty-state">暂无悬赏任务，可以在上方发布第一个任务。</div>`
+      : `<div class="content-panel empty-state">今天没有安排任务，好好休息一下吧。</div>`;
     return;
   }
-  list.innerHTML = tasks.map((task) => {
-    const assignments = appState.data.user.role === "admin" && task.assignments?.length ? `<div class="quest-assignees">${task.assignments.map(questAssignmentMarkup).join("")}</div>` : "";
-    const due = task.due_date ? `截止 ${escapeHtml(task.due_date)}` : "长期有效";
-    const rewardCoins = Number(task.reward_coins);
-    const baseReward = Number(task.base_reward_coins || rewardCoins);
-    const rewardNote = baseReward !== rewardCoins ? `<small class="quest-reward-note">基础 ${baseReward.toLocaleString("zh-CN")}</small>` : "";
-    return `<article class="quest-card ${task.task_type === "epic" ? "epic" : ""}"><div class="quest-card-head"><div class="quest-card-title">${iconMarkup(task.icon, "earn", "quest-icon") }<div><h2>${escapeHtml(task.title)}</h2><p>${escapeHtml(task.category)} · ${TASK_TYPE_TEXT[task.task_type] || task.task_type}</p></div></div><span class="quest-rarity">${TASK_DIFFICULTY_TEXT[task.difficulty] || task.difficulty}</span></div><p class="quest-description">${escapeHtml(task.description || "完成任务后提交，等待管理员验收。")}</p><div class="quest-card-meta"><span class="quest-reward">◆ ${rewardCoins.toLocaleString("zh-CN")} 积分${rewardNote}</span><span class="quest-reward">✦ ${Number(task.reward_exp).toLocaleString("zh-CN")} XP</span><span class="muted">${due}</span></div><div class="quest-card-actions">${taskActionMarkup(task)}</div>${assignments}</article>`;
-  }).join("");
+  const isDone = (task) => isAdmin
+    ? (task.assignments?.length > 0 && task.assignments.every((assignment) => assignment.status === "completed"))
+    : task.my_assignment?.status === "completed";
+  const doneTasks = tasks.filter(isDone);
+  const activeTasks = tasks.filter((task) => !isDone(task));
+  // 归档里被删掉的任务不再保留勾选
+  appState.pickedDoneTasks = appState.pickedDoneTasks.filter((id) => doneTasks.some((task) => Number(task.id) === id));
+  const emptyHint = !activeTasks.length
+    ? `<div class="content-panel quest-all-done">${isAdmin ? "进行中的任务都已完成，可在下方归档里查看或删除。" : "今天的任务都完成了，真棒！"}</div>`
+    : "";
+  list.innerHTML = `${emptyHint}${activeTasks.map((task) => questCardMarkup(task)).join("")}${doneTasks.length ? questDoneSection(doneTasks) : ""}`;
+}
+
+// v0.11.0 每日提交审核额度：家长看到的是当前选中孩子的额度，孩子看到的是自己的。
+function renderSubmitQuota() {
+  const node = document.getElementById("quest-quota");
+  if (!node) return;
+  const quota = appState.data?.submit_quota;
+  if (!quota) {
+    node.classList.add("hidden");
+    return;
+  }
+  node.classList.remove("hidden");
+  const isAdmin = appState.data.user.role === "admin";
+  const used = Number(quota.used || 0);
+  const exhausted = !quota.unlimited && Number(quota.remaining ?? 0) <= 0;
+  // 文案保持一行内可读（窄屏 360px 也不换行），细则放在账号弹窗的说明里
+  if (quota.unlimited) {
+    node.textContent = `今日提交审核：不限次数（已提交 ${used} 次）`;
+  } else if (exhausted) {
+    node.textContent = `${isAdmin ? "当前孩子" : "你"}今日提交审核已用完（${used} / ${quota.limit}），明天恢复`;
+  } else {
+    node.textContent = `${isAdmin ? "当前孩子今日提交" : "今日提交审核"}：还剩 ${quota.remaining} 次（已用 ${used} / ${quota.limit}）`;
+  }
+  node.classList.toggle("quest-quota-exhausted", exhausted);
 }
 
 function renderQuestFocus() {
   const focus = document.getElementById("child-quest-focus");
   if (!focus) return;
-  const task = (appState.data.tasks || []).find((item) => item.task_type === "epic") || (appState.data.tasks || [])[0];
+  const tasks = appState.data.tasks || [];
+  // 优先展示今天真正能做的：史诗悬赏 → 今天触发的任务 → 其余（即将到来的）
+  const task = tasks.find((item) => item.task_type === "epic" && item.active_today !== false)
+    || tasks.find((item) => item.active_today !== false)
+    || tasks[0];
   const title = document.getElementById("quest-focus-title");
   const description = document.getElementById("quest-focus-description");
   const reward = document.getElementById("quest-focus-reward");
@@ -564,7 +870,10 @@ function renderQuestFocus() {
   reward.textContent = `${rewardCoins.toLocaleString("zh-CN")} 积分${baseReward !== rewardCoins ? `（基础 ${baseReward.toLocaleString("zh-CN")}）` : ""}`;
   exp.textContent = `${Number(task.reward_exp).toLocaleString("zh-CN")} XP`;
   const assignment = task.my_assignment;
-  const actionState = !assignment ? { action: "claim-task", id: task.id, label: "领取任务" } : assignment.status === "claimed" || assignment.status === "rejected" ? { action: "submit-task", id: assignment.id, label: assignment.status === "rejected" ? "重新提交" : "提交验收" } : { action: "", id: "", label: TASK_STATUS_TEXT[assignment.status] || assignment.status };
+  const lockedToday = task.task_type === "repeat" && task.active_today === false;
+  const actionState = lockedToday
+    ? { action: "", id: "", label: task.next_date ? `下次 ${String(task.next_date).slice(5)} 开始` : "尚未开始" }
+    : !assignment ? { action: "claim-task", id: task.id, label: "领取任务" } : assignment.status === "claimed" || assignment.status === "rejected" ? { action: "submit-task", id: assignment.id, label: assignment.status === "rejected" ? "重新提交" : "提交验收" } : { action: "", id: "", label: TASK_STATUS_TEXT[assignment.status] || assignment.status };
   action.textContent = actionState.label;
   action.dataset.action = actionState.action;
   action.dataset.id = actionState.id;
@@ -642,7 +951,7 @@ function resetAnnouncementEditor() {
   appState.announcementEditId = null;
   form.reset();
   form.elements.announcement_id.value = "";
-  form.querySelector("button[type='submit']").textContent = "发布通告";
+  form.querySelector("button[type='submit']").textContent = "发布通知";
   document.getElementById("cancel-announcement-edit")?.classList.add("hidden");
 }
 
@@ -651,12 +960,14 @@ function openAnnouncementEdit(id) {
   const form = document.getElementById("announcement-form");
   if (!announcement || !form) return;
   appState.announcementEditId = Number(id);
+  appState.announcementFormOpen = true;
   form.elements.announcement_id.value = announcement.id;
   form.elements.title.value = announcement.title;
   form.elements.content.value = announcement.content;
   form.elements.audience.value = announcement.audience;
-  form.querySelector("button[type='submit']").textContent = "保存通告";
+  form.querySelector("button[type='submit']").textContent = "保存通知";
   document.getElementById("cancel-announcement-edit")?.classList.remove("hidden");
+  syncAnnouncementEditor();
   form.elements.title.focus();
 }
 
@@ -679,6 +990,7 @@ async function saveAnnouncement(event) {
       body: JSON.stringify(payload),
     });
     resetAnnouncementEditor();
+    appState.announcementFormOpen = false;
     render();
     showToast("通告已保存");
   } catch (error) {
@@ -705,18 +1017,41 @@ function renderAchievements() {
   list.innerHTML = achievements.length ? achievements.map((achievement) => `<article class="achievement-card${achievement.unlocked ? "" : " locked"}"><div class="achievement-medal"><img src="${illustrationSource(achievement.icon, "reward")}" alt=""></div><strong>${escapeHtml(achievement.title)}</strong><p>${escapeHtml(achievement.description)}</p><small>${achievement.unlocked ? `已解锁 · ${displayDateTime(achievement.unlocked_at)}` : "未解锁"}</small></article>`).join("") : `<div class="content-panel empty-state">创建孩子账号后即可开始收集成就。</div>`;
 }
 
+// 待办口径（v0.10.1）：积分申请 + 任务验收，两处表格共用
+function pendingTotal(item) {
+  return Number(item?.pending_count || 0) + Number(item?.task_pending_count || 0);
+}
+
+// v0.13.2：账号管理页改为「一账号一折叠卡片」——摘要一行（头像/名称/积分/待审核），明细展开看。
+function accountCardMarkup(account, currentId) {
+  const isChild = account.role === "child";
+  const limit = Number(account.daily_submit_limit || 0);
+  const used = Number(account.today_submit_count || 0);
+  const quotaText = isChild ? (limit ? `${used} / ${limit}` : `${used} / 不限`) : "—";
+  const quotaOver = isChild && limit > 0 && used >= limit;
+  const pending = pendingTotal(account);
+  const roleText = isChild ? "孩子账号" : "管理账号";
+  const open = appState.openAccounts[String(account.id)] ? " open" : "";
+  const deleteButton = Number(account.id) === currentId ? "" : `<button class="button button-small button-outline-danger" data-action="delete-account" data-id="${account.id}" type="button">删除</button>`;
+  return `<details class="account-card" data-account-id="${account.id}"${open}><summary class="account-card-summary"><span class="table-person">${avatarImage(account.avatar, "avatar avatar-table", account.display_name)}<span class="account-card-name"><strong>${escapeHtml(account.display_name)}</strong><small>${escapeHtml(account.username)} · ${roleText}</small></span></span><span class="account-card-side"><span class="account-card-points"><strong>${Number(account.total_points).toLocaleString("zh-CN")}</strong><small>${moneyText(account.total_points)}</small></span><span class="pending-badge" title="待审核事项">${pending}</span><span aria-hidden="true" class="collapsible-caret">▾</span></span></summary><div class="account-card-body"><dl class="account-facts"><div><dt>登录账号</dt><dd>${escapeHtml(account.username)}</dd></div><div><dt>账号类型</dt><dd>${roleText}</dd></div><div><dt>今日变化</dt><dd class="${Number(account.today_net) >= 0 ? "income" : "expense"}">${signed(account.today_net)}</dd></div><div><dt>待审核</dt><dd>${pending} 项</dd></div><div><dt>今日提交</dt><dd class="${quotaOver ? "quota-over" : ""}">${quotaText}</dd></div><div><dt>折合金额</dt><dd>${moneyText(account.total_points)}</dd></div></dl><div class="row-actions"><button class="button button-small button-outline" data-action="edit-account" data-id="${account.id}" type="button">编辑</button>${deleteButton}</div></div></details>`;
+}
+
 function renderAccounts() {
   const summaryBody = document.getElementById("account-summary-body");
   const logBody = document.getElementById("account-log-body");
   if (!summaryBody || !logBody || appState.data.user.role !== "admin") return;
   const currentId = Number(appState.data.user.id);
   const overview = appState.data.account_overview || [];
-  summaryBody.innerHTML = overview.length ? overview.map((account) => {
-    const isChild = account.role === "child";
-    const deleteButton = Number(account.id) === currentId ? "" : `<button class="button button-small button-outline-danger" data-action="delete-account" data-id="${account.id}" type="button">删除</button>`;
-    const action = `<div class="row-actions"><button class="button button-small button-outline" data-action="edit-account" data-id="${account.id}" type="button">编辑</button>${deleteButton}</div>`;
-    return `<tr><td><div class="table-person">${avatarImage(account.avatar, "avatar avatar-table", account.display_name)}<div><strong>${escapeHtml(account.display_name)}</strong><small>${escapeHtml(account.avatar === "girl" ? "女孩头像" : account.avatar === "boy" ? "男孩头像" : "管理头像")}</small></div></div></td><td>${escapeHtml(account.username)}</td><td>${isChild ? "孩子账号" : "管理账号"}</td><td class="table-number">${Number(account.total_points).toLocaleString("zh-CN")}</td><td class="table-number">${moneyText(account.total_points)}</td><td class="table-number ${Number(account.today_net) >= 0 ? "income" : "expense"}">${signed(account.today_net)}</td><td><span class="pending-badge">${Number(account.pending_count)}</span></td><td>${action}</td></tr>`;
-  }).join("") : `<tr><td colspan="8"><div class="empty-state">暂无账号</div></td></tr>`;
+  summaryBody.innerHTML = overview.length
+    ? overview.map((account) => accountCardMarkup(account, currentId)).join("")
+    : `<div class="empty-state">暂无账号</div>`;
+  const toggleAll = document.getElementById("toggle-account-cards");
+  if (toggleAll) {
+    const cards = [...summaryBody.querySelectorAll("details.account-card")];
+    const anyClosed = cards.some((card) => !card.open);
+    toggleAll.textContent = anyClosed ? "全部展开" : "全部收起";
+    toggleAll.setAttribute("aria-expanded", anyClosed ? "false" : "true");
+  }
   const actionText = { create_child: "新增孩子", register_child: "孩子自助注册", create_admin: "新增管理", update_child: "修改孩子资料", update_admin: "修改管理资料", delete_child: "删除孩子", delete_admin: "删除管理", change_password: "孩子修改密码" };
   logBody.innerHTML = (appState.data.account_logs || []).length ? appState.data.account_logs.map((log) => `<tr><td>${displayDateTime(log.created_at)}</td><td><div class="table-person">${avatarImage(log.actor_avatar, "avatar avatar-table", log.actor_name)}<strong>${escapeHtml(log.actor_name)}</strong></div></td><td><span class="log-action ${log.target_role === "admin" ? "admin" : "child"}">${actionText[log.action] || escapeHtml(log.action)}</span></td><td><div class="table-person">${avatarImage(log.target_avatar, "avatar avatar-table", log.target_name)}<div><strong>${escapeHtml(log.target_name)}</strong><small>${escapeHtml(log.target_username)}</small></div></div></td><td>${log.target_role === "admin" ? "管理账号" : "孩子账号"}</td></tr>`).join("") : `<tr><td colspan="5"><div class="empty-state">暂无账号变更记录</div></td></tr>`;
 }
@@ -806,6 +1141,80 @@ function renderQuestIconPicker() {
   renderIconGroups(container, document.getElementById("quest-icon-search")?.value || "", document.getElementById("quest-icon")?.value || "", "data-task-icon");
 }
 
+// ---- 重复任务表单（v0.9.0）----
+const WEEKDAY_LABELS = { 1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "日" };
+let repeatFormApi = { sync: () => {}, setDays: () => {} };
+
+function setupRepeatForm() {
+  const panel = document.getElementById("repeat-panel");
+  const typeSelect = document.getElementById("quest-type");
+  const freqSelect = document.getElementById("repeat-freq");
+  const monthField = document.getElementById("repeat-month-week-field");
+  const monthSelect = document.getElementById("repeat-month-week");
+  const weekdaysField = document.getElementById("repeat-weekdays-field");
+  const hidden = document.getElementById("repeat-days-value");
+  const hint = document.getElementById("repeat-hint");
+  const chips = [...document.querySelectorAll("#weekday-chips .weekday-chip")];
+  if (!panel || !typeSelect || !freqSelect || !hidden) return;
+
+  const selectedDays = () => chips
+    .filter((chip) => chip.classList.contains("on"))
+    .map((chip) => Number(chip.dataset.weekday))
+    .sort((a, b) => a - b);
+  const setDays = (days) => chips.forEach((chip) => chip.classList.toggle("on", days.includes(Number(chip.dataset.weekday))));
+
+  function sync() {
+    const isRepeat = typeSelect.value === "repeat";
+    const days = selectedDays();
+    // 无论面板是否可见都同步一次，避免切换类型时残留上一次的选择
+    hidden.value = days.join(",");
+    panel.classList.toggle("hidden", !isRepeat);
+    if (!isRepeat) return;
+    const freq = freqSelect.value;
+    weekdaysField.classList.toggle("hidden", freq === "daily");
+    monthField.classList.toggle("hidden", freq !== "monthly");
+    if (freq === "daily") {
+      hint.textContent = "每天都会自动出现，不需要选择星期。";
+      return;
+    }
+    if (!days.length) {
+      hint.textContent = "请至少选择一个星期，否则任务不会触发。";
+      return;
+    }
+    const names = days.map((day) => WEEKDAY_LABELS[day]).join("、");
+    hint.textContent = freq === "weekly"
+      ? `每周${names}自动出现，孩子打开任务页就能看到。`
+      : `每月第 ${monthSelect.value === "5" ? "最后一个" : monthSelect.value} 个周${names}自动出现。`;
+  }
+
+  chips.forEach((chip) => chip.addEventListener("click", () => {
+    chip.classList.toggle("on");
+    sync();
+  }));
+  document.querySelectorAll("#repeat-panel [data-repeat-preset]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const preset = button.dataset.repeatPreset;
+      if (preset === "weekdays") setDays([1, 2, 3, 4, 5]);
+      else if (preset === "weekend") setDays([6, 7]);
+      else if (preset === "all") setDays([1, 2, 3, 4, 5, 6, 7]);
+      else setDays([]);
+      sync();
+    });
+  });
+  typeSelect.addEventListener("change", () => {
+    if (typeSelect.value === "repeat" && freqSelect.value !== "daily" && !selectedDays().length) setDays([1, 2, 3, 4, 5]);
+    sync();
+  });
+  freqSelect.addEventListener("change", () => {
+    if (freqSelect.value !== "daily" && !selectedDays().length) setDays([1, 2, 3, 4, 5]);
+    sync();
+  });
+  monthSelect.addEventListener("change", sync);
+
+  repeatFormApi = { sync, setDays };
+  sync();
+}
+
 function openManual() {
   const form = document.getElementById("manual-form");
   form.reset();
@@ -825,6 +1234,7 @@ function openAccount() {
   document.getElementById("account-modal-title").textContent = "新增账号";
   document.getElementById("account-username-field").classList.remove("hidden");
   document.getElementById("account-role-field").classList.remove("hidden");
+  document.getElementById("account-limit-field").classList.remove("hidden");
   form.elements.username.required = true;
   form.elements.password.required = true;
   fillAvatarOptions("child", "boy");
@@ -843,6 +1253,8 @@ function openEditAccount(id) {
   form.elements.username.required = false;
   form.elements.display_name.value = account.display_name;
   form.elements.password.required = false;
+  document.getElementById("account-limit-field").classList.toggle("hidden", account.role !== "child");
+  form.elements.daily_submit_limit.value = account.daily_submit_limit ?? DEFAULT_SUBMIT_LIMIT;
   fillAvatarOptions(account.role, account.avatar);
   showModal("account-form");
 }
@@ -898,6 +1310,16 @@ async function saveAccount(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const payload = { display_name: form.elements.display_name.value.trim(), password: form.elements.password.value, avatar: form.elements.avatar.value };
+  const limitField = document.getElementById("account-limit-field");
+  if (!limitField.classList.contains("hidden")) {
+    const raw = String(form.elements.daily_submit_limit.value || "").trim();
+    const limit = raw === "" ? DEFAULT_SUBMIT_LIMIT : Number(raw);
+    if (!Number.isInteger(limit) || limit < 0 || limit > MAX_SUBMIT_LIMIT) {
+      showToast(`每日提交上限必须是 0 到 ${MAX_SUBMIT_LIMIT} 的整数（0 表示不限制）`);
+      return;
+    }
+    payload.daily_submit_limit = limit;
+  }
   try {
     if (appState.accountEditId) {
       await api(`/api/accounts/${appState.accountEditId}`, { method: "PUT", body: JSON.stringify(payload) });
@@ -945,8 +1367,8 @@ function updateCashExchangePreview() {
   const chargedPoints = basePoints > 0 ? effectiveItemPoints(basePoints, "exchange", "child") : 0;
   const savedPoints = Math.max(0, basePoints - chargedPoints);
   const note = savedPoints > 0
-    ? `实际扣除 ${chargedPoints.toLocaleString("zh-CN")} 积分（原需 ${basePoints.toLocaleString("zh-CN")}，省 ${savedPoints.toLocaleString("zh-CN")}）`
-    : `实际扣除 ${chargedPoints.toLocaleString("zh-CN")} 积分`;
+    ? `实扣 ${chargedPoints.toLocaleString("zh-CN")} 积分（省 ${savedPoints.toLocaleString("zh-CN")}）`
+    : `实扣 ${chargedPoints.toLocaleString("zh-CN")} 积分`;
   preview.textContent = `到账 ${moneyText(basePoints)} · ${note}`;
 }
 
@@ -1062,9 +1484,102 @@ async function saveAdventureLevel(event) {
   }
 }
 
+function resetQuestForm() {
+  const form = document.getElementById("quest-form");
+  if (!form) return;
+  form.reset();
+  form.elements.reward_coins.value = 20;
+  form.elements.reward_exp.value = 10;
+  repeatFormApi.setDays([]);
+  repeatFormApi.sync();
+  syncTaskFormMode();
+}
+
+function syncTaskFormMode() {
+  const editing = Boolean(appState.taskEditId);
+  const submit = document.getElementById("quest-submit");
+  if (submit) submit.textContent = editing ? "保存修改" : "发布任务";
+  const cancel = document.getElementById("quest-cancel-edit");
+  if (cancel) cancel.classList.toggle("hidden", !editing);
+  const heading = document.getElementById("quest-form-title");
+  if (heading) heading.textContent = editing ? "编辑任务" : "发布新悬赏";
+}
+
+function startTaskEdit(id) {
+  const task = (appState.data.tasks || []).find((item) => Number(item.id) === Number(id));
+  if (!task) return;
+  if (task.edit_locked) { showToast("该任务已有审核通过的提交，不能再编辑"); return; }
+  const form = document.getElementById("quest-form");
+  appState.taskEditId = Number(id);
+  form.elements.title.value = task.title || "";
+  form.elements.description.value = task.description || "";
+  form.elements.category.value = task.category || "生活";
+  form.elements.task_type.value = task.task_type || "daily";
+  form.elements.difficulty.value = task.difficulty || "normal";
+  form.elements.reward_coins.value = Number(task.base_reward_coins || task.reward_coins) || 20;
+  form.elements.reward_exp.value = Number(task.reward_exp) || 10;
+  form.elements.due_date.value = task.due_date || "";
+  if (task.icon && [...form.elements.icon.options].some((option) => option.value === task.icon)) {
+    form.elements.icon.value = task.icon;
+  }
+  form.elements.repeat_freq.value = task.repeat_freq || "weekly";
+  form.elements.repeat_month_week.value = String(task.repeat_month_week || 1);
+  form.elements.repeat_start.value = task.repeat_start || "";
+  form.elements.repeat_end.value = task.repeat_end || "";
+  repeatFormApi.setDays(Array.isArray(task.repeat_days) ? task.repeat_days : []);
+  repeatFormApi.sync();
+  syncTaskFormMode();
+  document.getElementById("quest-form-title")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  showToast(`正在编辑「${task.title}」`);
+}
+
+async function deleteTask(id) {
+  const task = (appState.data.tasks || []).find((item) => Number(item.id) === Number(id));
+  if (!task) return;
+  const inFlight = (task.assignments || []).filter((assignment) => ["claimed", "submitted"].includes(assignment.status)).length;
+  const extra = inFlight ? `已有 ${inFlight} 条领取/提交记录会一并归档。` : "";
+  if (!await requestConfirm(`删除「${task.title}」后孩子将不再看到这个任务。${extra}确定继续吗？`, { title: "删除任务", confirmLabel: "删除任务" })) return;
+  try {
+    await api(`/api/tasks/${id}`, { method: "DELETE" });
+    if (Number(appState.taskEditId) === Number(id)) {
+      appState.taskEditId = null;
+      resetQuestForm();
+    }
+    await loadState();
+    navigate("quests");
+    showToast("任务已删除");
+  } catch (error) { showToast(error.message); }
+}
+
+// v0.13.5：批量删除归档里勾选的已完成任务（一次确认，逐个调删除接口，中途失败即停）
+async function batchDeleteDoneTasks() {
+  const ids = [...appState.pickedDoneTasks];
+  if (!ids.length) return;
+  const tasks = appState.data.tasks || [];
+  const names = ids.map((id) => (tasks.find((task) => Number(task.id) === id) || {}).title || `#${id}`);
+  const label = names.length <= 3 ? `（${names.map((name) => `「${name}」`).join(" ")}）` : "";
+  if (!await requestConfirm(`确定删除选中的 ${ids.length} 个已完成任务吗？${label}删除后孩子将不再看到这些任务。`, { title: "批量删除任务", confirmLabel: "删除" })) return;
+  let removed = 0;
+  for (const id of ids) {
+    try {
+      await api(`/api/tasks/${id}`, { method: "DELETE" });
+      removed += 1;
+      if (Number(appState.taskEditId) === Number(id)) { appState.taskEditId = null; resetQuestForm(); }
+    } catch (error) {
+      showToast(error.message);
+      break;
+    }
+  }
+  appState.pickedDoneTasks = [];
+  await loadState();
+  navigate("quests");
+  showToast(removed === ids.length ? `已删除 ${removed} 个任务` : `已删除 ${removed} / ${ids.length} 个任务`);
+}
+
 async function saveTask(event) {
   event.preventDefault();
   const form = event.currentTarget;
+  const editingId = appState.taskEditId;
   const payload = {
     title: form.elements.title.value.trim(),
     description: form.elements.description.value.trim(),
@@ -1080,14 +1595,35 @@ async function saveTask(event) {
     showToast("请填写任务标题、积分和经验奖励");
     return;
   }
+  if (payload.task_type === "repeat") {
+    payload.repeat_freq = form.elements.repeat_freq.value;
+    payload.repeat_days = form.elements.repeat_days.value;
+    payload.repeat_month_week = Number(form.elements.repeat_month_week.value);
+    payload.repeat_start = form.elements.repeat_start.value;
+    payload.repeat_end = form.elements.repeat_end.value;
+    if (payload.repeat_start && payload.repeat_end && payload.repeat_end < payload.repeat_start) {
+      showToast("生效结束日期不能早于开始日期");
+      return;
+    }
+    if (payload.repeat_freq !== "daily" && !payload.repeat_days) {
+      showToast("请至少选择一个触发星期");
+      return;
+    }
+  }
   try {
+    if (editingId) {
+      appState.data = await api(`/api/tasks/${editingId}`, { method: "PUT", body: JSON.stringify(payload) });
+      appState.taskEditId = null;
+      resetQuestForm();
+      render();
+      showToast("任务已更新");
+      return;
+    }
     const result = await api("/api/tasks", { method: "POST", body: JSON.stringify(payload) });
     appState.data = result.state;
-    form.reset();
-    form.elements.reward_coins.value = 20;
-    form.elements.reward_exp.value = 10;
+    resetQuestForm();
     render();
-    showToast("悬赏任务已发布");
+    showToast(payload.task_type === "repeat" ? "重复任务已发布，到点会自动出现" : "悬赏任务已发布");
   } catch (error) { showToast(error.message); }
 }
 
@@ -1100,7 +1636,11 @@ async function handleTaskAction(action, id) {
     appState.data = result.state || result;
     render();
     showToast(action === "claim" ? "已领取任务" : action === "submit" ? "已提交验收" : action === "approve" ? "任务已完成，积分和经验已发放" : "已退回任务");
-  } catch (error) { showToast(error.message); }
+  } catch (error) {
+    showToast(error.message);
+    // 撞上每日提交额度（429）时把额度提示条刷新到最新
+    if (error.status === 429) await syncState({ force: true });
+  }
 }
 
 async function saveManual(event) {
@@ -1138,6 +1678,10 @@ function showToast(message) {
 document.addEventListener("click", async (event) => {
   const pageTarget = event.target.closest("[data-page-target]");
   if (pageTarget) { navigate(pageTarget.dataset.pageTarget); return; }
+  const settingsTabTarget = event.target.closest("[data-settings-tab]");
+  if (settingsTabTarget) { appState.settingsTab = settingsTabTarget.dataset.settingsTab; syncSettingsTabs(); return; }
+  const itemTabTarget = event.target.closest("[data-item-tab]");
+  if (itemTabTarget) { appState.itemTab = itemTabTarget.dataset.itemTab; syncItemTabs(); return; }
   const dateTarget = event.target.closest("[data-select-date]");
   if (dateTarget) { appState.selectedDate = dateTarget.dataset.selectDate; navigate("records"); return; }
   const iconTarget = event.target.closest("[data-project-icon]");
@@ -1161,9 +1705,21 @@ document.addEventListener("click", async (event) => {
     return;
   }
   const editorTarget = event.target.closest("[data-open-editor]");
-  if (editorTarget) { openEditor(editorTarget.dataset.openEditor); return; }
+  if (editorTarget) {
+    // v0.13.0：三个项目面板改成 Tab 后，点「新增」要先切到对应 Tab，否则表单藏在别的分区里
+    const kind = editorTarget.dataset.openEditor;
+    if (["earn", "deduct", "reward"].includes(kind)) { appState.itemTab = kind; syncItemTabs(); }
+    // 折叠面板时点「新增」要自动展开，否则保存后新条目藏在收起区里看不见
+    if (kind in appState.settingsPanels) { appState.settingsPanels[kind] = true; syncSettingsPanels(); }
+    openEditor(kind);
+    return;
+  }
   const closeTarget = event.target.closest("[data-close-modal]");
   if (closeTarget) { closeModal(); return; }
+  const opKindTarget = event.target.closest("[data-op-kind]");
+  if (opKindTarget) { setOpKind(opKindTarget.dataset.opKind); return; }
+  const itemKindTarget = event.target.closest("[data-item-kind]");
+  if (itemKindTarget) { setItemKind(itemKindTarget.dataset.itemKind); return; }
   const action = event.target.closest("[data-action]");
   if (!action) return;
   try {
@@ -1176,11 +1732,15 @@ document.addEventListener("click", async (event) => {
     if (action.dataset.action === "reject-request") await reviewRequest("reject", Number(action.dataset.id));
     if (action.dataset.action === "claim-task") await handleTaskAction("claim", Number(action.dataset.id));
     if (action.dataset.action === "submit-task") await handleTaskAction("submit", Number(action.dataset.id));
+    if (action.dataset.action === "edit-task") startTaskEdit(Number(action.dataset.id));
+    if (action.dataset.action === "delete-task") await deleteTask(Number(action.dataset.id));
+    if (action.dataset.action === "batch-delete-tasks") await batchDeleteDoneTasks();
     if (action.dataset.action === "approve-task") await handleTaskAction("approve", Number(action.dataset.id));
     if (action.dataset.action === "reject-task") await handleTaskAction("reject", Number(action.dataset.id));
     if (action.dataset.action === "edit-announcement") openAnnouncementEdit(Number(action.dataset.id));
     if (action.dataset.action === "delete-announcement") await deleteAnnouncement(Number(action.dataset.id));
     if (action.dataset.action === "undo") await undoRecord(Number(action.dataset.id));
+    if (action.dataset.action === "export") await exportFamilyData();
   } catch (error) { showToast(error.message); }
 });
 
@@ -1268,13 +1828,25 @@ document.getElementById("announcement-popup-close")?.addEventListener("click", c
 document.getElementById("announcement-popup-ack")?.addEventListener("click", closeAnnouncementPopup);
 document.getElementById("icon-search")?.addEventListener("input", renderIconPicker);
 document.getElementById("quest-icon-search")?.addEventListener("input", renderQuestIconPicker);
-document.getElementById("cancel-announcement-edit")?.addEventListener("click", resetAnnouncementEditor);
+document.getElementById("cancel-announcement-edit")?.addEventListener("click", () => {
+  resetAnnouncementEditor();
+  appState.announcementFormOpen = true;
+  syncAnnouncementEditor();
+});
+document.getElementById("quest-cancel-edit")?.addEventListener("click", () => {
+  appState.taskEditId = null;
+  resetQuestForm();
+  showToast("已退出编辑");
+});
 document.getElementById("open-account").addEventListener("click", openAccount);
 document.getElementById("open-manual").addEventListener("click", openManual);
 document.getElementById("open-self-password").addEventListener("click", openSelfPassword);
 document.getElementById("open-child-register").addEventListener("click", showChildRegister);
 document.getElementById("back-to-login").addEventListener("click", showLogin);
-document.getElementById("account-form").elements.role.addEventListener("change", (event) => fillAvatarOptions(event.target.value));
+document.getElementById("account-form").elements.role.addEventListener("change", (event) => {
+  fillAvatarOptions(event.target.value);
+  document.getElementById("account-limit-field").classList.toggle("hidden", event.target.value !== "child");
+});
 document.getElementById("adventure-level-form")?.elements.mode.addEventListener("change", (event) => {
   const level = document.getElementById("adventure-level-form")?.elements.level;
   if (level) level.disabled = event.target.value !== "manual";
@@ -1282,6 +1854,65 @@ document.getElementById("adventure-level-form")?.elements.mode.addEventListener(
 document.getElementById("logout-button").addEventListener("click", async () => { try { await api("/api/auth/logout", { method: "POST" }); } finally { showLogin(); } });
 document.getElementById("child-select").addEventListener("change", async (event) => {
   try { appState.data = await api("/api/auth/select-child", { method: "POST", body: JSON.stringify({ child_id: Number(event.target.value) }) }); navigate("home"); showToast(`已切换到 ${appState.data.active_child.display_name}`); } catch (error) { showToast(error.message); }
+});
+document.getElementById("home-tabs")?.addEventListener("click", (event) => {
+  const tab = event.target.closest("[data-home-tab]");
+  if (!tab) return;
+  appState.homeTab = tab.dataset.homeTab;
+  syncHomeTabs();
+});
+document.getElementById("toggle-announcement-editor")?.addEventListener("click", () => {
+  appState.announcementFormOpen = !appState.announcementFormOpen;
+  syncAnnouncementEditor();
+  if (appState.announcementFormOpen) document.querySelector("#announcement-form input[name='title']")?.focus();
+});
+document.getElementById("toggle-account-detail")?.addEventListener("click", () => {
+  appState.accountDetailOpen = !appState.accountDetailOpen;
+  syncAccountDetail();
+});
+// v0.13.2：账号卡片折叠 —— 记录展开状态（toggle 不冒泡，用捕获阶段监听），并支持一键全部展开/收起
+document.getElementById("account-summary-body")?.addEventListener("toggle", (event) => {
+  const card = event.target.closest?.("details.account-card");
+  if (card) appState.openAccounts[String(card.dataset.accountId)] = card.open;
+}, true);
+// v0.13.5 任务归档：折叠状态要跨重渲染保留（toggle 不冒泡，用捕获阶段监听）
+document.getElementById("quest-list")?.addEventListener("toggle", (event) => {
+  const panel = event.target.closest?.("details.quest-done-panel");
+  if (panel) appState.questDoneOpen = panel.open;
+}, true);
+// v0.13.5 批量删除的勾选：单个勾选 / 全选，勾完即时刷新工具条计数
+document.addEventListener("change", (event) => {
+  const pick = event.target.closest("[data-pick-task]");
+  if (pick) {
+    const id = Number(pick.dataset.pickTask);
+    const picked = new Set(appState.pickedDoneTasks);
+    if (pick.checked) picked.add(id); else picked.delete(id);
+    appState.pickedDoneTasks = [...picked];
+    renderQuests();
+    return;
+  }
+  if (event.target.id === "quest-pick-all") {
+    const boxes = [...document.querySelectorAll("#quest-done-panel [data-pick-task]")];
+    appState.pickedDoneTasks = event.target.checked ? boxes.map((node) => Number(node.dataset.pickTask)) : [];
+    renderQuests();
+  }
+});
+document.getElementById("toggle-account-cards")?.addEventListener("click", (event) => {
+  const list = document.getElementById("account-summary-body");
+  if (!list) return;
+  const cards = [...list.querySelectorAll("details.account-card")];
+  if (!cards.length) return;
+  const expand = cards.some((card) => !card.open);
+  cards.forEach((card) => { card.open = expand; });
+  event.currentTarget.textContent = expand ? "全部收起" : "全部展开";
+  event.currentTarget.setAttribute("aria-expanded", expand ? "true" : "false");
+});
+document.querySelectorAll("[data-toggle-settings-panel]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const key = button.dataset.toggleSettingsPanel;
+    appState.settingsPanels[key] = !appState.settingsPanels[key];
+    syncSettingsPanels();
+  });
 });
 document.getElementById("prev-month").addEventListener("click", () => { if (appState.historyMonth === 0) { appState.historyMonth = 11; appState.historyYear -= 1; } else appState.historyMonth -= 1; renderHistory(); });
 document.getElementById("next-month").addEventListener("click", () => { if (appState.historyMonth === 11) { appState.historyMonth = 0; appState.historyYear += 1; } else appState.historyMonth += 1; renderHistory(); });
@@ -1291,6 +1922,28 @@ document.getElementById("confirm-close").addEventListener("click", () => settleC
 document.getElementById("confirm-submit").addEventListener("click", () => settleConfirm(true));
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !document.getElementById("modal-backdrop").classList.contains("hidden")) closeModal();
+});
+// v0.13.0 覆盖式导入：先自动备份当前整库，再整体替换为备份文件内容
+document.getElementById("import-data").addEventListener("click", () => document.getElementById("import-file").click());
+document.getElementById("import-file").addEventListener("change", async (event) => {
+  const input = event.target;
+  const file = input.files && input.files[0];
+  input.value = "";                       // 清空后同一个文件才能再次触发 change
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const ok = await requestConfirm(`导入会覆盖当前全部数据（账号、积分记录、任务、项目设置），导入前会自动备份一份。确定导入「${file.name}」吗？`, { title: "导入家庭数据", confirmLabel: "确认导入" });
+    if (!ok) return;
+    const result = await api("/api/import", { method: "POST", body: text });
+    if (result.relogin) {                 // 导入的是别处的数据，当前管理账号已不存在
+      showToast("导入完成，请用备份文件里的账号重新登录");
+      showLogin();
+      return;
+    }
+    appState.data = result.state;
+    render();
+    showToast(result.backup ? "导入完成，旧数据已自动备份到 data/backups" : "导入完成");
+  } catch (error) { showToast(error.message); }
 });
 document.getElementById("clear-points").addEventListener("click", async () => {
   if (!await requestConfirm("确定清空当前孩子的全部积分记录吗？", { title: "清空积分记录", confirmLabel: "清空记录" })) return;
@@ -1302,4 +1955,121 @@ document.getElementById("reset-system").addEventListener("click", async () => {
 });
 
 renderQuestIconPicker();
+setupRepeatForm();
+syncTaskFormMode();
+setupTheme();
+startConnectionMonitor();
 loadState();
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/static/sw.js").catch(() => {});
+  });
+}
+
+function applyTableLabels() {
+  document.querySelectorAll(".management-table").forEach((table) => {
+    const headers = [...table.querySelectorAll("thead th")].map((th) => th.textContent.trim());
+    table.querySelectorAll("tbody tr").forEach((tr) => {
+      const cells = tr.children;
+      for (let i = 0; i < cells.length; i += 1) {
+        cells[i].setAttribute("data-label", headers[i] || "");
+      }
+    });
+  });
+}
+
+function startConnectionMonitor() {
+  const indicator = document.getElementById("connection-state");
+  if (!indicator) return;
+  indicator.dataset.monitorReady = "1";
+  async function poll() {
+    try {
+      const res = await fetch("/api/health", { cache: "no-store" });
+      if (!res.ok) throw new Error("bad status");
+      indicator.textContent = "已连接";
+      indicator.classList.add("is-online");
+      indicator.classList.remove("is-offline");
+    } catch (_error) {
+      indicator.textContent = "连接异常";
+      indicator.classList.add("is-offline");
+      indicator.classList.remove("is-online");
+    }
+  }
+  poll();
+  setInterval(poll, 30000);
+  setInterval(() => syncState({ force: true }), 60000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      poll();
+      syncState({ force: true });
+    }
+  });
+  window.addEventListener("focus", () => syncState());
+}
+
+function setupTheme() {
+  const button = document.getElementById("theme-toggle");
+  function apply(theme) {
+    if (theme === "dark") document.documentElement.dataset.theme = "dark";
+    else delete document.documentElement.dataset.theme;
+    if (button) button.textContent = theme === "dark" ? "☀ 浅色" : "🌙 深色";
+  }
+  let saved = "light";
+  try { saved = localStorage.getItem("rewardhub-theme") || "light"; } catch (_error) {}
+  apply(saved);
+  button?.addEventListener("click", () => {
+    const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+    apply(next);
+    try { localStorage.setItem("rewardhub-theme", next); } catch (_error) {}
+  });
+}
+
+async function exportFamilyData() {
+  if (appState.data?.user?.role !== "admin") {
+    showToast("仅管理账号可导出家庭数据");
+    return;
+  }
+  try {
+    const res = await fetch("/api/export");
+    if (res.status === 401) { showLogin(); return; }
+    if (!res.ok) throw new Error("导出失败");
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    a.href = url;
+    a.download = `rewardhub-家庭数据-${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    showToast("家庭数据已导出");
+  } catch (error) {
+    showToast(error.message || "导出失败");
+  }
+}
+
+let celebrationBaseline = null;
+function detectCelebration(data) {
+  const gamification = data.gamification || {};
+  const level = Number(gamification.level || 1);
+  const ids = new Set((data.achievements || []).filter((a) => a.unlocked).map((a) => a.id));
+  if (!celebrationBaseline) { celebrationBaseline = { level, ids }; return; }
+  if (level > celebrationBaseline.level) celebrate(`升级到 LV ${level}！`);
+  ids.forEach((id) => { if (!celebrationBaseline.ids.has(id)) celebrate("解锁新成就！"); });
+  celebrationBaseline = { level, ids };
+}
+
+function celebrate(message) {
+  const overlay = document.getElementById("celebration");
+  if (!overlay) return;
+  const text = overlay.querySelector(".celebration-text");
+  if (text) text.textContent = message;
+  overlay.classList.remove("hidden");
+  requestAnimationFrame(() => overlay.classList.add("show"));
+  clearTimeout(celebrate.timer);
+  celebrate.timer = setTimeout(() => {
+    overlay.classList.remove("show");
+    setTimeout(() => overlay.classList.add("hidden"), 300);
+  }, 2400);
+}
