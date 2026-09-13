@@ -43,7 +43,7 @@ RewardHub（中文名“带娃神器”）是一套面向家庭的本地积分�
 ```yaml
 services:
   rewardhub:
-    image: ghcr.io/fcyl-12/rewardhub:latest
+    image: ghcr.io/yangmouren/rewardhub:latest
     container_name: rewardhub
     ports:
       - "9696:9696"
