@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.13.7 - 2026-09-13
+
+- Update Docker image reference in README (4a8a2cc)
+
 ## v0.13.6 - 2026-09-13
 
 - release: RewardHub v0.6.3 (9f67c9f)
