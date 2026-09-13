@@ -6,6 +6,9 @@ RewardHub（中文名“带娃神器”）是一套面向家庭的本地积分�
 
 当前版本：`0.13.8`
 
+原作者： [fcyl-12/RewardHub](https://github.com/fcyl-12/RewardHub)
+我根据自身需求做了些调整和修改。修改完全靠Ai。
+
 ## 本次更新（0.8.0及之后的更新都是Ai编程，基本全程workbuddy）
 
 - 版本升级到 `0.13.6`。
