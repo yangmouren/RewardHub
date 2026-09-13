@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.13.8 - 2026-09-13
+
+- 修改更新说明 (81f4a82)
+
 ## v0.13.7 - 2026-09-13
 
 - Update Docker image reference in README (4a8a2cc)

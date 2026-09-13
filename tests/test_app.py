@@ -313,7 +313,7 @@ class PointsManagerApiTests(unittest.TestCase):
     def test_v06_child_permissions_avatars_and_account_edit(self):
         self.create_child(username="child", display_name="小朋友")
         state = self.state()
-        self.assertEqual(state["version"], "0.13.7")
+        self.assertEqual(state["version"], "0.13.8")
         self.assertEqual(state["user"]["avatar"], "adult-male")
         self.assertEqual(state["active_child"]["avatar"], "boy")
 
@@ -686,7 +686,7 @@ class PointsManagerApiTests(unittest.TestCase):
             response.close()
 
 
-    # ---- v0.13.7 重复任务 ----
+    # ---- v0.13.8 重复任务 ----
 
     def test_repeat_task_rules_trigger_on_expected_days(self):
         from datetime import date
@@ -849,7 +849,7 @@ class PointsManagerApiTests(unittest.TestCase):
         self.assertTrue(today_task["active_today"])
         self.assertIsNotNone(today_task["my_assignment"], "当天该触发的重复任务应自动可见")
         self.assertEqual(today_task["my_assignment"]["status"], "claimed")
-        # v0.13.7：当天不触发、但计划未结束的重复任务，孩子端以「未开始 · 下次 X」提前可见
+        # v0.13.8：当天不触发、但计划未结束的重复任务，孩子端以「未开始 · 下次 X」提前可见
         upcoming = next(item for item in child_state["tasks"] if item["title"] == "只在那天")
         self.assertFalse(upcoming["active_today"])
         self.assertIsNone(upcoming["my_assignment"], "未开始的任务不该被提前物化成已领取")
@@ -906,7 +906,7 @@ class PointsManagerApiTests(unittest.TestCase):
         self.client.delete(f"/api/tasks/{task_id}")
 
 
-    # ---- v0.13.7 任务可见性 / 编辑删除 ----
+    # ---- v0.13.8 任务可见性 / 编辑删除 ----
 
     def test_next_repeat_occurrence_returns_exact_date(self):
         from datetime import date
@@ -1031,7 +1031,7 @@ class PointsManagerApiTests(unittest.TestCase):
         self.assertNotIn("倒垃圾并套袋", [item["title"] for item in self.state()["tasks"]])
 
 
-    # ---- v0.13.7 审核中心：任务验收队列 ----
+    # ---- v0.13.8 审核中心：任务验收队列 ----
 
     def reset_task_state(self):
         """清掉历史用例遗留的任务/提交，保证审核队列断言不受执行顺序影响。"""
@@ -1113,7 +1113,7 @@ class PointsManagerApiTests(unittest.TestCase):
         self.assertEqual(self.state()["task_reviews"], [])
 
     def test_task_edit_locks_after_approval(self):
-        """v0.13.7：验收通过后不能再编辑（重复任务例外，它要长期复用）。"""
+        """v0.13.8：验收通过后不能再编辑（重复任务例外，它要长期复用）。"""
         self.reset_task_state()
         self.create_child(username="lock-child", display_name="锁定孩子", password="child123")
         base = {"reward_coins": 10, "reward_exp": 5, "icon": "points.svg"}
@@ -1193,7 +1193,7 @@ class PointsManagerApiTests(unittest.TestCase):
         self.assertEqual(len(self.state()["task_reviews"]), 1)
 
 
-    # ---- v0.13.7 每日提交审核额度 ----
+    # ---- v0.13.8 每日提交审核额度 ----
     def switch_user(self, username, password="child123"):
         self.client.post("/api/auth/logout")
         response = self.client.post("/api/auth/login", json={"username": username, "password": password})
@@ -1407,7 +1407,7 @@ class PointsManagerApiTests(unittest.TestCase):
     def test_export_contains_every_table(self):
         self.create_child()
         payload = self.client.get("/api/export").get_json()
-        self.assertEqual(payload["version"], "0.13.7")
+        self.assertEqual(payload["version"], "0.13.8")
         for table in (
             "accounts", "earn_items", "deduct_items", "rewards", "records",
             "point_requests", "account_logs", "app_settings", "tasks",
